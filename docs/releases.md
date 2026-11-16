@@ -15,7 +15,7 @@ flowchart LR
 
 运行时 ACP 握手、启动日志和 `node dist/index.cjs --version` 使用同一 package 版本；构建时打包版本数据，不从业务项目的 package 读取。镜像 OCI version 标签和 Cosign 签名中的 version 注解同样使用发布校验的 package 版本。
 
-首次发布使用 `0.1.0`，由配置中的 `initial-version: 0.1.0` 固定；manifest 从该版本开始记录，当前已是 `0.2.0`。后续版本按提交类型递增。镜像发布仅支持稳定三段版本号，不发布 `latest`、主版本浮动标签或预发布版本，不发布 npm 包。首次真实发布需合并发布 PR 并等待镜像任务成功。
+首次发布使用 `0.1.0`，由配置中的 `initial-version: 0.1.0` 固定；manifest 从该版本开始记录，当前版本以 `package.json` 和 manifest 为准。后续版本按提交类型递增。镜像发布仅支持稳定三段版本号，不发布 `latest`、主版本浮动标签或预发布版本，不发布 npm 包。首次真实发布需合并发布 PR 并等待镜像任务成功。
 
 ## 一次性设置
 
@@ -43,7 +43,7 @@ feat!: 调整不兼容的配置格式
 
 采用默认版本策略：`fix` 对应补丁，`feat` 对应次版本，破坏性变更对应主版本。Release Please 汇总提交，创建或更新发布 PR；检查 PR 中的 package 版本和 changelog 后合并，即完成发布决策。只包含普通 `docs`/`chore` 等提交时，不一定会提出新版本。可在 Actions 手动运行 Release workflow 重新处理 `main`。
 
-当前版本已经是 `0.2.0`，无需额外指定。以后需要明确指定下一版本时，可在合并提交消息中加入 `Release-As` footer，保持空行，例如升级至 `0.3.0`：
+常规发布无需手动指定版本。需要明确指定下一版本时，可在合并提交消息中加入 `Release-As` footer，保持空行，例如升级至 `0.3.0`：
 
 ```text
 chore: prepare stable release
