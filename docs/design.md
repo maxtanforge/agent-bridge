@@ -321,6 +321,7 @@ Agent 子进程仅获得运行所需的系统路径、临时目录、HOME/USERPR
 | 路径、事务、持久化 | [core.test.ts](../test/core.test.ts) |
 | 鉴权、互斥、取消、结果重试与取回 | [bridge.test.ts](../test/bridge.test.ts) |
 | FIFO 队列、自动回复时机、4 小时闲置回收 | [queue.test.ts](../test/queue.test.ts)、[background-reply.test.ts](../test/background-reply.test.ts)、[session-idle.test.ts](../test/session-idle.test.ts) |
+| ACP 活动与等待回答反馈、5 秒兜底、迟到事件、Typing 清理和落盘失败保护 | [acp-feedback.test.ts](../test/acp-feedback.test.ts)、[task-feedback.test.ts](../test/task-feedback.test.ts) |
 | 原生命令、事件投影、交互问题和配置 | [native-commands.test.ts](../test/native-commands.test.ts)、[agent-state.test.ts](../test/agent-state.test.ts)、[interactions.test.ts](../test/interactions.test.ts)、[runtime-config.test.ts](../test/runtime-config.test.ts) |
 | 原生能力协商、模式、署名设置及附件输入 | [runtime-capabilities.test.ts](../test/runtime-capabilities.test.ts)、[attachments.test.ts](../test/attachments.test.ts) |
 | 结束原因、部分输出和失败清理后继续队列 | [stop-reason.test.ts](../test/stop-reason.test.ts) |
@@ -335,4 +336,4 @@ Agent 子进程仅获得运行所需的系统路径、临时目录、HOME/USERPR
 
 本地验证命令为 pnpm typecheck、pnpm test、pnpm build、pnpm test:bundle。上述命令已在 Windows 上验证，测试覆盖上述行为；workflow 通过 actionlint 静态检查。Linux 清理分支由受控进程组替身验证，实时验证结果以当前提交的 CI 为准。
 
-真实飞书扫码注册、收发及卡片点击、模型工具执行与权限设置组合、真实历史会话恢复、代理连通性、Linux 真实进程树清理、Docker 镜像构建运行均未完成验收。扫码注册测试使用模拟授权响应和传输，不创建真实应用。上述限制保留为部署条件，自动测试通过不代表生产验收完成。
+`v0.4.0` 的 Docker 构建、GHCR 推送、Cosign 签名和验签已通过[发布流水线](https://github.com/maxtanforge/agent-bridge/actions/runs/43835813215)。真实飞书扫码注册、收发及卡片展示、模型工具执行与权限设置组合、真实历史会话恢复、代理连通性、Linux 真实进程树清理和目标环境容器运行仍需部署验收。扫码注册测试使用模拟授权响应和传输，不创建真实应用。自动测试及镜像发布成功不代表生产验收完成。

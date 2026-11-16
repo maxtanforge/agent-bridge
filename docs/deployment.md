@@ -29,11 +29,13 @@ flowchart LR
 下载仓库中的 `compose.image.yaml` 和 `.env.example`，将后者复制为 `.env`。在 `.env` 中取消 `AGENTBRIDGE_IMAGE` 的注释，选择已经成功发布的版本，例如：
 
 ```dotenv
-AGENTBRIDGE_IMAGE=ghcr.io/maxtanforge/agent-bridge:0.2.0
+AGENTBRIDGE_IMAGE=ghcr.io/maxtanforge/agent-bridge:0.4.0
 WORKSPACE_PROJECT=.
 ```
 
-示例使用已发布的 `0.2.0`。部署其他版本时，以仓库 Releases 和 Packages 中发布成功的版本为准。镜像使用完整版本号，Compose 要求显式设置 `AGENTBRIDGE_IMAGE`。当前构建平台为 `linux/amd64`。发布镜像经过 Cosign 无密钥签名和验签。部署前可按[镜像签名与验证](releases.md#镜像签名与验证)核对身份、版本和 digest。
+示例使用已发布的 `0.4.0`。部署其他版本时，以仓库 Releases 和 Packages 中发布成功的版本为准。镜像使用完整版本号，Compose 要求显式设置 `AGENTBRIDGE_IMAGE`。当前构建平台为 `linux/amd64`。发布镜像经过 Cosign 无密钥签名和验签。部署前可按[镜像签名与验证](releases.md#镜像签名与验证)核对身份、版本和 digest。
+
+从旧版本升级到 `0.4.0` 时，同时检查已有 `.env`：若希望启用新的默认交互，将 `TASK_REPLY_MODE=auto` 改为 `TASK_REPLY_MODE=stream`；保留显式 auto 或 background 就会继续使用对应模式。`TASK_BACKGROUND_NOTICE_MS=5000` 在 stream 下用于无可见回复时的反馈兜底，也决定长任务终态提醒阈值，不会取消或切断 ACP 执行。修改镜像版本和配置后执行下方的 pull/up 命令重建容器，仅 restart 不会应用新的镜像或环境配置。
 
 ```sh
 docker compose -f compose.image.yaml pull
@@ -158,4 +160,4 @@ Dockerfile 分为基础工具、依赖安装、ncc 构建、生产依赖裁剪�
 
 `AgentBridge started` 在飞书长连接就绪后记录；首次连接超过 30 秒或遇到不可恢复错误会启动失败。运行期间的不可恢复连接错误会记录脱敏日志并以非零退出码停机，由 Compose 重启；可恢复断线由 SDK 重连。连接就绪不代表权限和事件订阅已经生效，部署时需在默认 `TASK_REPLY_MODE=stream` 下实际验证短任务结果、工具活动、5 秒无输出状态、等待回答和长任务完成提醒，以及卡片出现后 Typing 移除。已有 `.env` 若显式指定 auto，需修改为 stream 并重建容器。
 
-配置真实凭证后逐项验证：文本任务修改测试文件、连续对话、免审批读写执行、Typing 清理、CardKit 原生流式与关闭、缺权限时的富文本降级、长文续发和代码块渲染、取消、重复事件、容器重启后恢复。Linux 真实进程组与 Docker 构建运行仍需在目标环境验收；未经此验收不能视为生产上线完成。本地测试使用模拟 ACP 子进程，并包含已安装真实 Adapter 的协议协商检查，不调用模型、不发送飞书消息。
+配置真实凭证后逐项验证：文本任务修改测试文件、连续对话、免审批读写执行、Typing 清理、CardKit 原生流式与关闭、缺权限时的富文本降级、长文续发和代码块渲染、取消、重复事件、容器重启后恢复。发布流水线已验证 Docker 构建、推送及签名；Linux 真实进程组清理和容器实际运行仍需在目标环境验收；未经此验收不能视为生产上线完成。本地测试使用模拟 ACP 子进程，并包含已安装真实 Adapter 的协议协商检查，不调用模型、不发送飞书消息。
