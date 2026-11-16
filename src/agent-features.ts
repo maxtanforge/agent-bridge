@@ -15,17 +15,29 @@ export class AgentFeatures {
   constructor(db: Store, runtime: Runtime, ports: Ports) { this.db = db; this.runtime = runtime; this.ports = ports; }
   state(key: string) { return this.states.get(key); }
   clear(key: string) { this.states.delete(key); }
-  begin(m: Inbound) {
+  begin(m: Inbound, onActivity?: (text: string) => void) {
     const key = this.ports.key(m); const state = new AgentState(this.ports.workspace);
     const run: Run = { key, state, executing: false, steering: false, abort: new AbortController() };
     this.current = run; this.states.delete(key); this.states.set(key, state);
     while (this.states.size > 128) this.states.delete(this.states.keys().next().value!);
     const hooks: RuntimeHooks = { ...this.db.preferences(key),
-      onEvent: event => { if (this.current === run && !run.abort.signal.aborted) state.apply(event); },
+      onEvent: event => {
+        if (this.current !== run || run.abort.signal.aborted) return;
+        state.apply(event);
+        if (event.type === 'update' && ['tool_call', 'tool_call_update', 'plan'].includes(String(event.update.sessionUpdate))) {
+          onActivity?.(this.interactions.count(key) ? '等待你回答，使用 /questions 查看。' : state.activityText());
+        }
+      },
       onQuestion: async (question, signal) => {
         if (this.current !== run || !run.executing || run.session !== question.sessionId) return { action: 'cancel' };
-        return this.interactions.ask(key, question, signal ? AbortSignal.any([signal, run.abort.signal]) : run.abort.signal,
-          text => this.ports.send(m, text));
+        onActivity?.('等待你回答，使用 /questions 查看。');
+        try {
+          return await this.interactions.ask(key, question, signal ? AbortSignal.any([signal, run.abort.signal]) : run.abort.signal,
+            text => this.ports.send(m, text));
+        } finally {
+          if (this.current === run && !run.abort.signal.aborted) onActivity?.(this.interactions.count(key)
+            ? '等待你回答，使用 /questions 查看。' : state.activityText());
+        }
       },
     };
     return { hooks, state,

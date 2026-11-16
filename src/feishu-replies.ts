@@ -90,6 +90,7 @@ type ReplyState = {
   closed: boolean;
   /** 已确认送达的富文本分片 uuid；失败续发从未确认分片继续。 */
   posted: Set<string>;
+  progress: boolean;
 };
 
 export class FeishuReplies {
@@ -135,11 +136,11 @@ export class FeishuReplies {
     const key = this.key(m, reply.id);
     let state = this.tasks.get(key);
     if (!state) {
-      state = { sequence: 0, accepted: '', fallback: false, closed: false, posted: new Set() };
+      state = { sequence: 0, accepted: '', fallback: false, closed: false, posted: new Set(), progress: false };
       this.tasks.set(key, state);
     }
     const final = reply.state !== TaskState.Running;
-    const text = [reply.text, reply.note].filter(Boolean).join('\n\n');
+    const text = [!final && reply.activity, reply.text, reply.note].filter(Boolean).join('\n\n');
     const chunks = splitReply(text);
     if (!chunks.length) return;
     if (!state.fallback && !state.card) {
@@ -167,10 +168,22 @@ export class FeishuReplies {
         signal?.throwIfAborted(); state.fallback = true; this.warn('stream-update', error);
       }
     }
-    if (final) {
+    if (!final) {
+      if (state.fallback) {
+        const notice = `任务正在执行，完成后通知你。\n任务编号：${reply.id}\n/status 查看进度；/cancel ${reply.id} 取消。`;
+        await this.posts(m, notice, [notice], 0, signal, state);
+        await this.close(state, signal);
+      }
+      state.progress = true;
+    } else {
       await this.close(state, signal);
       // Only an accepted first chunk may replace the first rich-post chunk.
       await this.posts(m, text, chunks, state.fallback ? 0 : 1, signal, state);
+      if (reply.notifyCompletion && state.progress && !state.fallback && chunks.length === 1) {
+        const status = reply.state === TaskState.Completed ? '已完成' : reply.state === TaskState.Cancelled ? '已取消' : '未正常完成';
+        const notice = `任务${status}，结果见任务卡片。\n任务编号：${reply.id}\n/result ${reply.id} 可重新获取结果。`;
+        await this.posts(m, notice, [notice], 0, signal, state);
+      }
     }
   }
 }

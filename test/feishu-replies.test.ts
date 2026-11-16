@@ -27,13 +27,36 @@ test('native stream uses cumulative content, closes once, and has no task header
   assert.equal(card.body.elements[0].element_id, 'content');
   assert.doesNotMatch(streamCard(), /collapsible_panel|正在处理|回复/);
 });
-test('unavailable CardKit falls back to rich posts only at final, without repeated creation', async () => {
+test('unavailable CardKit sends one acknowledgement then final without repeated creation', async () => {
   const { replies, transport, calls } = fixture(); let creates = 0;
   transport.create = async () => { creates++; throw new Error('permission'); };
   await replies.task(message, { id: 't', state: 'running', text: 'draft' });
+  await replies.task(message, { id: 't', state: 'running', text: 'more draft' });
   await replies.task(message, { id: 't', state: 'completed', text: 'answer' });
-  assert.equal(creates, 1); assert.deepEqual(calls.map(c => c.op), ['post']);
-  assert.equal(calls[0].text, 'answer');
+  assert.equal(creates, 1); assert.deepEqual(calls.map(c => c.op), ['post', 'post']);
+  assert.match(String(calls[0].text), /正在执行/); assert.equal(calls[1].text, 'answer');
+});
+
+test('long stream completion reminder is deduplicated and activity is removed from final', async () => {
+  const { calls, replies } = fixture();
+  await replies.task(message, { id: 't', state: 'running', text: 'draft', activity: '正在测试' });
+  assert.match(String(calls.find(c => c.op === 'update')?.text), /正在测试/);
+  const final = { id: 't', state: 'completed' as const, text: 'answer', notifyCompletion: true };
+  await replies.task(message, final); await replies.task(message, final);
+  assert.equal(calls.filter(c => c.op === 'post').length, 1);
+  assert.match(String(calls.find(c => c.op === 'post')?.text), /已完成/);
+  assert.equal(calls.filter(c => c.op === 'update').at(-1)?.text, 'answer');
+});
+
+test('a newly delivered final result needs no separate completion reminder', async () => {
+  for (const mode of ['new', 'fallback', 'continuation']) {
+    const { calls, replies, transport } = fixture();
+    if (mode === 'fallback') transport.create = async () => { throw new Error('permission'); };
+    if (mode !== 'new') await replies.task(message, { id: 't', state: 'running', text: 'draft' });
+    const text = mode === 'continuation' ? 'x'.repeat(4000) : 'answer';
+    await replies.task(message, { id: 't', state: 'completed', text, notifyCompletion: true });
+    assert.equal(calls.filter(c => c.op === 'post' && String(c.text).includes('结果见任务卡片')).length, 0);
+  }
 });
 test('uncertain card reply retries the same card reference and UUID', async () => {
   const { replies, transport, calls } = fixture(); const send = transport.reply; let attempts = 0;

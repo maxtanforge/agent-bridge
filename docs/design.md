@@ -18,7 +18,9 @@ flowchart LR
   R <--> A["Claude ACP 子进程"]
   A --> GW["模型网关"]
   A --> W["/data/workspace<br/>固定项目"]
-  B --> P["feishu-replies.ts<br/>卡片 / 分片 / 降级"]
+  B --> TF["task-feedback.ts<br/>反馈合并 / Typing / 兜底计时"]
+  TF --> P["feishu-replies.ts<br/>卡片 / 分片 / 降级"]
+  B --> P
   B --> D[("SQLite<br/>/data/bridge")]
   P -->|结果 / 卡片| U
 ```
@@ -64,6 +66,8 @@ sequenceDiagram
 
 入队回执与执行并行，最终回复等待本任务回执和在途进度；排队等待不计入执行时限。命令、去重键和会话键的细节见[接入与命令](#接入与命令)。
 
+终态与结果落盘失败时停止接收新任务并触发服务停机，尽力投递当前结果及存储失败提示；不能在失去持久化保障后继续修改工作区。部署者需检查磁盘和 SQLite，避免盲目重发已执行任务。
+
 ### 任务状态机
 
 ```mermaid
@@ -88,7 +92,7 @@ stateDiagram-v2
 
 ## 运行范围与技术选型
 
-服务通过飞书 WebSocket 接收消息，由外部 Claude ACP 进程执行任务。默认短任务直接回复，长任务先发送后台通知再返回结果；stream 模式使用 Typing 表情和原位更新的 Markdown 卡片。当前仅支持一个飞书应用、一个固定项目、一个服务实例。工作区内的任务串行执行，忙时按接收顺序排队，默认最多 20 个等待项。飞书投递可以与下一项执行重叠。
+服务通过飞书 WebSocket 接收消息，由外部 Claude ACP 进程执行任务。默认 stream 模式展示短暂 Typing、ACP 活动与正文流式卡片；5 秒无可见反馈时补状态卡。当前仅支持一个飞书应用、一个固定项目、一个服务实例。工作区内的任务串行执行，忙时按接收顺序排队，默认最多 20 个等待项。飞书投递可以与下一项执行重叠。
 
 Node.js 运行要求见 [package.json](../package.json) 的 `engines.node`。使用 TypeScript、ACP SDK、飞书 SDK、Pino、Zod 和 Node 内置 SQLite。模块由构造函数注入依赖，不引入 @maxtan/nest-core：当前没有 HTTP 管理接口、Web 鉴权或 Redis 等需要该框架承载的入口。
 
@@ -108,6 +112,7 @@ Node.js 运行要求见 [package.json](../package.json) 的 `engines.node`。使
 | [attachments.ts](../src/attachments.ts)、[runtime-config.ts](../src/runtime-config.ts) | 内存附件解码与部署原生配置校验 |
 | [runtime.ts](../src/runtime.ts) | ACP stdio 协商、新建/恢复会话、权限模式、prompt 和进程生命周期 |
 | [feishu-replies.ts](../src/feishu-replies.ts) | CardKit 流式生命周期、富文本降级、Markdown 分片与续发去重 |
+| [task-feedback.ts](../src/task-feedback.ts) | 任务局部反馈合并、可见状态兜底和 Typing 清理；不持有调度权 |
 | [task.ts](../src/task.ts) | 任务状态、执行阶段、投递状态、控制命令及执行限制的统一定义 |
 | [store.ts](../src/store.ts) | SQLite 去重、任务/结果事务、会话映射和重启恢复 |
 | [delivery-error.ts](../src/delivery-error.ts)、[diagnostics.ts](../src/diagnostics.ts)、[timeout.ts](../src/timeout.ts) | 投递错误分类、安全日志字段和有界等待 |
@@ -174,7 +179,7 @@ flowchart TD
 
 ## 任务与会话生命周期
 
-回复模式由 TASK_REPLY_MODE 控制，默认 auto；三种模式的用户可见行为见[回复方式](usage.md#回复方式)。实现上，auto 在达到 TASK_BACKGROUND_NOTICE_MS（默认 5 秒，范围 1–60 秒）时通知一次；回执不阻塞模型执行，最终回复等待其有界投递结束；执行结束清除通知计时器，避免迟发“仍在执行”；排队等待不计入该计时。
+回复模式由 TASK_REPLY_MODE 控制，默认 stream；三种模式的用户可见行为见[回复方式](usage.md#回复方式)。task-feedback.ts 管理流式合并和 Typing，工具按 ID 合并，等待回答优先于工具状态。stream 在阈值时没有可见反馈则补状态，不推断卡死或完成百分比；兼容 auto 在达到 TASK_BACKGROUND_NOTICE_MS（默认 5 秒，范围 1–60 秒）时通知一次；回执不阻塞模型执行，最终回复等待其有界投递结束；执行结束清除通知计时器，避免迟发“仍在执行”；排队等待不计入该计时。
 
 1. 鉴权后处理控制命令与拒绝输入，独立去重；普通任务进入接纳逻辑。控制命令不会进入队列或模型。
 2. 正常任务在 BEGIN IMMEDIATE 事务内同时插入去重记录和 running（空闲）或 queued（繁忙）任务。事务失败整体回滚并提示重新发送。队列满时仅消费消息去重键，明确告知未接纳。队列项的 prompt 仅在内存中保留。
@@ -234,15 +239,15 @@ POSIX 启动独立进程组：先 SIGTERM，最多等待 1.5 秒；仍存活则 
 
 只转发 agent_message_chunk 的文本，不转发内部思考内容。输出缓存保留末尾 24,000 个 Unicode 码点，超限时在正文前加截断提示；最终保存相同文本。stream 模式下每 250 毫秒至多提交一次累计快照，新输出在上次更新进行中合并，不并发修改卡片；最终结果等待在途进度结束后投递，避免旧进度覆盖最终内容。不附带任务 ID 或原始 stopReason；取消或非正常结束响应保留部分输出时，会附明确的原因提示。
 
-首次有实际输出或结束时调用 cardkit.v1.card.create 创建 card_json，schema=2.0、config.streaming_mode=true，body 仅包含 element_id=content 的 Markdown 元素，不设置任务标题或折叠容器。通过 im.message.reply 发送 msg_type=interactive 的卡片引用，随后调用 cardkit.v1.cardElement.content 写入累计正文；递增 sequence、独立操作 UUID 控制更新顺序。最终正文写入后调用 card.settings 关闭 streaming_mode 并设置最多 100 个码点的摘要。关闭失败只记录日志，任务清理再以 3 秒窗口尝试关闭，不重复发送已接受的正文。卡片状态仅保留于当前任务内存，不跨重启恢复。
+首次有正文、ACP 活动、兜底状态或最终结果时调用 cardkit.v1.card.create 创建 card_json，schema=2.0、config.streaming_mode=true，body 仅包含 element_id=content 的 Markdown 元素，不设置任务标题或折叠容器。通过 im.message.reply 发送 msg_type=interactive 的卡片引用，随后调用 cardkit.v1.cardElement.content 写入活动摘要与累计正文；递增 sequence、独立操作 UUID 控制更新顺序。最终正文替换活动摘要后调用 card.settings 关闭 streaming_mode 并设置最多 100 个码点的摘要。关闭失败只记录日志，任务清理再以 3 秒窗口尝试关闭，不重复发送已接受的正文。卡片状态仅保留于当前任务内存，不跨重启恢复。
 
 每片最多取 3,000 个原文码点，优先在后半段的换行处切分；常见反引号/波浪线代码围栏跨段时补齐闭合与重新打开标记，不删除原文。第一片在同一卡片中更新，后续分片在最终阶段按序发送 post，内容为 zh_cn.content 中的 md 元素。控制回复和 /result 也使用该富文本路径。分片限制及围栏上限使序列化内容低于 28,000 字节；这不是完整 Markdown 语法树切分，极长表格或行内标记跨段可能影响格式。模型输出中的 at 标签前缀会转义，避免解析为飞书群成员通知。
 
-CardKit 创建或正文更新失败，或卡片引用发送被 API 明确永久拒绝时，本任务停止尝试流式更新，最终通过 post 投递完整已保存回复；若已有预览则先尝试关闭旧卡片。卡片引用发送结果不明确或被限流时保留 card_id，重试使用相同 UUID 与引用内容，不立即另发富文本，以免出现重复回复。后续富文本分片使用稳定 UUID，并在任务内记录已确认的分片，重试从未确认分片继续。Bridge 不在渠道失败后另发整份结果；未送达内容可用 /result 主动取回。
+CardKit 创建或正文更新失败，或卡片引用发送被 API 明确永久拒绝时，本任务停止尝试流式更新，进度阶段只发一次执行回执，最终通过 post 投递完整已保存回复；若已有预览则先尝试关闭旧卡片。卡片引用发送结果不明确或被限流时保留 card_id，重试使用相同 UUID 与引用内容，不立即另发富文本，以免出现重复回复。后续富文本分片使用稳定 UUID，并在任务内记录已确认的分片，重试从未确认分片继续。达到反馈阈值且已有进度卡的任务，最终仅原位更新首片时另发一次简短终态提醒，使用稳定 UUID 去重；有结果分片或降级结果新消息时不再提醒。Bridge 不在渠道失败后另发整份结果；未送达内容可用 /result 主动取回。
 
-仅 stream 模式在原消息上添加一次 Typing，与模型启动并行，结束/失败/取消后移除，不循环重加；添加和移除分别最多等待 3 秒，失败只记录脱敏日志。需要 im:message.reactions:write_only，CardKit 另需 cardkit:card:write；已有应用由管理员补充并发布，新扫码申请这两项。进程异常退出或远端清理失败可能遗留表情或流式状态。
+默认 stream 模式在原消息上添加一次 Typing，与模型启动并行，卡片或降级回执送达后移除，结束/失败/取消时兜底清理，迟到添加也清理，不循环重加；添加和移除分别最多等待 3 秒，失败只记录脱敏日志。需要 im:message.reactions:write_only，CardKit 另需 cardkit:card:write；已有应用由管理员补充并发布，新扫码申请这两项。进程异常退出或远端清理失败可能遗留表情或流式状态。
 
-最终投递遇到可恢复网络错误/限流最多尝试 3 次，卡片与富文本共用 15 秒窗口；进度投递不做应用层重试，下一快照可继续未完成的卡片引用发送。CardKit 创建/正文更新异常优先降级，关闭异常不将已接受的结果标为未送达。每个 HTTP 请求上限 10 秒，由独立 HTTP 实例通过 AsyncLocalStorage 接收当前 AbortSignal；过期窗口不继续发送余下分片。重试不重放 Agent prompt。交互路径参考 OpenClaw 的 [streaming-card.ts](https://github.com/openclaw/openclaw/blob/main/extensions/feishu/src/streaming-card.ts) 和 [reply-dispatcher.ts](https://github.com/openclaw/openclaw/blob/main/extensions/feishu/src/reply-dispatcher.ts)，不表示已实现其所有渠道能力。
+最终投递遇到可恢复网络错误/限流最多尝试 3 次，卡片与富文本共用 15 秒窗口；进度投递窗口最多 3 秒，不做应用层重试，下一快照可继续未完成的卡片引用发送。CardKit 创建/正文更新异常优先降级，关闭异常不将已接受的结果标为未送达。每个 HTTP 请求上限 10 秒，由独立 HTTP 实例通过 AsyncLocalStorage 接收当前 AbortSignal；过期窗口不继续发送余下分片。重试不重放 Agent prompt。交互路径参考 OpenClaw 的 [streaming-card.ts](https://github.com/openclaw/openclaw/blob/main/extensions/feishu/src/streaming-card.ts) 和 [reply-dispatcher.ts](https://github.com/openclaw/openclaw/blob/main/extensions/feishu/src/reply-dispatcher.ts)，不表示已实现其所有渠道能力。
 
 扫码时优先输出授权链接。日志二维码使用 L 纠错级别降低密度，每个模块占两个字符宽、一行高，不使用半格字符。每行独立设置 ANSI 黑色前景/亮白背景，深色模块同时设置黑背景并输出实心块，浅色模块输出两个空格；颜色变化处切换背景，行尾重置。四模块留白明确为白色，不依赖深色主题。剥离 ANSI 后仍保留字符图案，但不能保证主题对比度；查看器行距、字体和自动换行也可能破坏扫描，因此不声称日志图案适用于所有 Portainer 版本。
 
@@ -268,8 +273,8 @@ CardKit 创建或正文更新失败，或卡片引用发送被 API 明确永久�
 | DATABASE_PATH | 默认 data/agentbridge.db |
 | DATA_RETENTION_MS | 默认 2592000000（30 天）；范围 86400000–31536000000；启动时清理更早的去重、任务、结果与会话历史行；Compose 显式映射 |
 | TASK_TIMEOUT_MS | 默认 7,200,000（2 小时）；范围 1,000–86,400,000；Compose 显式映射，可通过部署环境覆盖 |
-| TASK_REPLY_MODE | 默认 auto：短任务直接返回，长任务通知一次；background 始终先回执；stream 显示 Typing 与流式卡片 |
-| TASK_BACKGROUND_NOTICE_MS | auto 模式通知延迟，默认 5000；可设 10000，范围 1000–60000；从实际执行开始计时，Compose 显式映射 |
+| TASK_REPLY_MODE | 默认 stream：短暂 Typing、ACP 活动与正文流式卡片；auto 兼容短任务直接返回、长任务通知一次；background 始终先回执 |
+| TASK_BACKGROUND_NOTICE_MS | stream 可见反馈兜底和终态提醒阈值 / auto 通知延迟，默认 5000；可设 10000，范围 1000–60000；从实际执行开始计时，Compose 显式映射 |
 | SESSION_IDLE_TIMEOUT_MS | 默认 14400000（4 小时）；范围 60000–604800000；会话及全局空闲 Adapter 回收期限，Compose 显式映射 |
 | CLAUDE_RUNTIME_CONFIG | 可选 JSON 文件路径，支持 mcpServers/maxTurns/maxBudgetUsd；相对工作区解析，Compose 显式映射；不回显凭据 |
 | CANCEL_GRACE_MS | 默认 5,000；范围 100–30,000 |

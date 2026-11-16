@@ -19,7 +19,7 @@ export const configSchema = z.object({
   ALLOWED_USERS: list.refine(a => a.length > 0, 'At least one allowed user required'),
   ADMIN_USERS: list.default([]),
   WORKSPACE_ROOT: z.string().min(1), WORKSPACE_PROJECT: z.string().default('.'),
-  TASK_REPLY_MODE: z.enum(['auto', 'background', 'stream']).default('auto'),
+  TASK_REPLY_MODE: z.enum(['auto', 'background', 'stream']).default('stream'),
   TASK_BACKGROUND_NOTICE_MS: z.coerce.number().int().min(1000).max(60000).default(TaskLimits.BackgroundNoticeDelayMs),
   SESSION_IDLE_TIMEOUT_MS: z.coerce.number().int().min(60000).max(7 * 24 * 60 * 60 * 1000).default(TaskLimits.SessionIdleTimeoutMs),
   CLAUDE_RUNTIME_CONFIG: z.string().trim().optional(),

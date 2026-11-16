@@ -30,6 +30,10 @@ export interface TaskReply {
   text: string;
   /** 附注（如原会话无法恢复），拼在最终文本之后投递。 */
   note?: string;
+  /** Running activity, separate from agent-authored text. */
+  activity?: string;
+  /** Notify completion when a long stream only updates an existing card. */
+  notifyCompletion?: boolean;
 }
 
 /** Bridge 对消息渠道的依赖；生产实现见 feishu.ts，测试以内联替身满足。 */

@@ -77,6 +77,12 @@ export class AgentState {
   commandsText() { return this.commands.length ? this.commands.map(c => `/${c.name.replace(/^\//, '')} — ${c.description}`).join('\n') : '尚未收到当前会话的 Claude 命令列表；先运行一次任务。'; }
   toolsText() { return this.tools.size ? [...this.tools.values()].slice(-10).map(t => `${t.title}：${t.status}`).join('\n') : '尚未收到工具执行事件。'; }
   brief() { const t = [...this.tools.values()].at(-1); return t ? `最近工具：${t.title}（${t.status}）` : ''; }
+  activityText() {
+    const active = [...this.tools.values()].filter(t => t.status === 'pending' || t.status === 'in_progress');
+    if (active.length) return `正在执行工具（${active.length} 项）：${active.slice(0, 3).map(t => t.title).join('；')}`;
+    const step = this.plan.find(e => e.status === 'in_progress');
+    return step ? `当前计划：${step.content}` : '正在处理';
+  }
   planText() { return this.plan.length ? this.plan.map(e => `[${e.status}] ${e.content}`).join('\n') : '尚未收到任务计划事件。'; }
   usageText() { const u = this.usage; return u ? `运行时报告的上下文：${u.used} / ${u.size}${u.amount === undefined ? '' : `\n运行时费用估算：${u.amount} ${u.currency}（以服务商账单为准）`}` : '尚未收到运行时用量数据。'; }
   capabilitiesText() { return this.capabilities ? `steering：${this.capabilities.steering ? '支持' : '不支持'}\n图片输入协议：${this.capabilities.image ? '支持' : '不支持'}\n以上为运行时协商结果，渠道入口支持情况见 /help。` : '尚未与 Claude 协商能力；先运行一次任务。'; }

@@ -15,7 +15,7 @@ flowchart LR
 
 运行时 ACP 握手、启动日志和 `node dist/index.cjs --version` 使用同一 package 版本；构建时打包版本数据，不从业务项目的 package 读取。镜像 OCI version 标签和 Cosign 签名中的 version 注解同样使用发布校验的 package 版本。
 
-首次发布使用 `0.1.0`，由配置中的 `initial-version: 0.1.0` 固定；manifest 从该版本开始记录，当前已是 `0.2.0`。后续版本按提交类型递增。镜像发布仅支持稳定三段版本号，不发布 `latest`、主版本浮动标签或预发布版本，不发布 npm 包。首次真实发布需合并发布 PR 并等待镜像任务成功。
+首次发布使用 `0.1.0`，由配置中的 `initial-version: 0.1.0` 固定；manifest 从该版本开始记录，当前版本以 `package.json` 和 manifest 为准。后续版本按提交类型递增。镜像发布仅支持稳定三段版本号，不发布 `latest`、主版本浮动标签或预发布版本，不发布 npm 包。首次真实发布需合并发布 PR 并等待镜像任务成功。
 
 ## 一次性设置
 
@@ -31,7 +31,9 @@ Release Please Action 固定为官方 `v5.0.0` 的提交 SHA，使用 Node 24 �
 
 ## 日常发布
 
-使用 Conventional Commits 合并变更到 `main`，例如：
+日常开发在 `dev`，使用 Conventional Commits 提交。准备发版时，通过开发 PR 将 `dev` 合入 `main`。Release Please 根据进入 `main` 的提交创建或更新发布 PR。暂缓发布时，保留发布 PR 供后续更新。发布完成后，将 `main` 合回 `dev`，同步版本记录和 changelog。
+
+提交消息示例：
 
 ```text
 fix: 修复工作区配置说明
@@ -41,7 +43,7 @@ feat!: 调整不兼容的配置格式
 
 采用默认版本策略：`fix` 对应补丁，`feat` 对应次版本，破坏性变更对应主版本。Release Please 汇总提交，创建或更新发布 PR；检查 PR 中的 package 版本和 changelog 后合并，即完成发布决策。只包含普通 `docs`/`chore` 等提交时，不一定会提出新版本。可在 Actions 手动运行 Release workflow 重新处理 `main`。
 
-当前版本已经是 `0.2.0`，无需额外指定。以后需要明确指定下一版本时，可在合并提交消息中加入 `Release-As` footer，保持空行，例如升级至 `0.3.0`：
+常规发布无需手动指定版本。需要明确指定下一版本时，可在合并提交消息中加入 `Release-As` footer，保持空行，例如升级至 `0.3.0`：
 
 ```text
 chore: prepare stable release
@@ -87,6 +89,8 @@ cosign verify "$IMAGE" \
 版本应替换为目标发布版本；还可添加 `-a revision=<摘要中的源码提交号>`。Fork 需将镜像地址和证书身份替换为自己的仓库，身份中的仓库大小写须与 GitHub 一致。验证成功后可将 `AGENTBRIDGE_IMAGE` 设置为同一完整 digest 部署，避免验证与拉取间标签变化。Compose/Portainer 不自动执行验签，需要在部署前执行；签名证明来源与内容完整性，不代表实际功能已经验收。
 
 镜像地址使用当前 GHCR 命名空间。镜像迁移后，验签仍使用发布摘要记录的原始身份。改名前签名的镜像可能记录的是 `https://github.com/MaxTan330/agent-bridge/.github/workflows/docker-publish.yml@refs/heads/main`。
+
+升级或回滚前，先确认目标标签在当前 GHCR 命名空间可拉取。GitHub Release 中存在版本标签时，仍需单独确认对应镜像可用。
 
 ## 重试、升级与回滚
 
