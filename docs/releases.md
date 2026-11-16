@@ -31,7 +31,9 @@ Release Please Action 固定为官方 `v5.0.0` 的提交 SHA，使用 Node 24 �
 
 ## 日常发布
 
-使用 Conventional Commits 合并变更到 `main`，例如：
+日常开发在 `dev`，使用 Conventional Commits 提交。准备发版时，通过开发 PR 将 `dev` 合入 `main`。Release Please 根据进入 `main` 的提交创建或更新发布 PR。暂缓发布时，保留发布 PR 供后续更新。发布完成后，将 `main` 合回 `dev`，同步版本记录和 changelog。
+
+提交消息示例：
 
 ```text
 fix: 修复工作区配置说明
@@ -87,6 +89,8 @@ cosign verify "$IMAGE" \
 版本应替换为目标发布版本；还可添加 `-a revision=<摘要中的源码提交号>`。Fork 需将镜像地址和证书身份替换为自己的仓库，身份中的仓库大小写须与 GitHub 一致。验证成功后可将 `AGENTBRIDGE_IMAGE` 设置为同一完整 digest 部署，避免验证与拉取间标签变化。Compose/Portainer 不自动执行验签，需要在部署前执行；签名证明来源与内容完整性，不代表实际功能已经验收。
 
 镜像地址使用当前 GHCR 命名空间。镜像迁移后，验签仍使用发布摘要记录的原始身份。改名前签名的镜像可能记录的是 `https://github.com/MaxTan330/agent-bridge/.github/workflows/docker-publish.yml@refs/heads/main`。
+
+升级或回滚前，先确认目标标签在当前 GHCR 命名空间可拉取。GitHub Release 中存在版本标签时，仍需单独确认对应镜像可用。
 
 ## 重试、升级与回滚
 

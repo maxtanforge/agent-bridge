@@ -6,6 +6,7 @@ import { bounded } from './timeout.ts';
 import { errorFacts, type DiagnosticLogger } from './diagnostics.ts';
 import { isRetryableDelivery } from './delivery-error.ts';
 import { AgentFeatures } from './agent-features.ts';
+import { TaskFeedback } from './task-feedback.ts';
 import { nativeCommand } from './commands.ts';
 import { AttachmentError } from './attachments.ts';
 import { ChatCommand, DeliveryState, isControlCommand, StopReason, incompleteReasonText, TaskState, TaskPhase, TaskPhaseLabel, TaskLimits, elapsedText } from './task.ts';
@@ -28,9 +29,9 @@ type Options = {
   deliveryTimeout?: number;
   /** 全局等待队列容量；不包括正在执行的任务。 */
   queueLimit?: number;
-  /** auto 仅长任务通知；background 总是先回执；stream 显示 Typing 与流式正文。 */
+  /** 默认 stream 展示 ACP 活动和正文；auto 仅长任务通知；background 总是先回执。 */
   replyMode?: 'auto' | 'background' | 'stream';
-  /** auto 模式等待多久后发送一次后台通知。 */
+  /** stream 无可见反馈时的兜底 / auto 后台通知延迟。 */
   backgroundNoticeMs?: number;
   /** 会话及空闲 Adapter 的闲置回收期限，默认四小时。 */
   sessionIdleMs?: number;
@@ -117,9 +118,9 @@ export class Bridge {
       ? this.channel.task(m, reply, signal) : this.channel.send(m, reply.text, signal), retry);
   }
   /** 投递最终结果（或 /result 取回）并记录投递状态；送达与否不影响已落盘的终态。 */
-  private async result(m: Inbound, task: string, text: string, state?: TaskReply['state'], note?: string) {
+  private async result(m: Inbound, task: string, text: string, state?: TaskReply['state'], note?: string, notifyCompletion = false) {
     // The channel owns fallback and chunk deduplication; sending again here could repeat accepted chunks.
-    const sent = state ? await this.taskReply(m, { id: task, state, text, note }, true) : await this.send(m, text, true);
+    const sent = state ? await this.taskReply(m, { id: task, state, text, note, notifyCompletion }, true) : await this.send(m, text, true);
     try { this.db.delivered(task, sent); } catch (error) { this.report(error, 'delivery-state', task); }
   }
   private canManage(m: Inbound, task: Inbound) {
@@ -292,7 +293,7 @@ export class Bridge {
       startedAt: Date.now(), phase: TaskPhase.Starting,
       done: new Promise<void>(r => { done = r; }), executionDone: new Promise<void>(r => { executionDone = r; }) };
     this.active = a;
-    const mode = this.options.replyMode ?? 'auto';
+    const mode = this.options.replyMode ?? 'stream';
     const background = mode !== 'stream';
     // 回执与模型启动并行；最终结果等待回执结束，避免完成通知排在回执之前。
     let feedbackReady = !queuedAcknowledgement;
@@ -301,7 +302,7 @@ export class Bridge {
     let accepted = queueFeedback;
     const acknowledge = () => {
       accepted = queueFeedback.then(async () => {
-        if (queuedAcknowledgement && (executionEnded || a.cancelled)) return;
+        if (executionEnded || a.cancelled) return;
         await this.deliver(signal => this.channel.send(m,
           `已接收，任务正在后台执行，完成后会通知你。\n任务编号：${id}\n/status 查看进度；/cancel ${id} 取消本项。`, signal), false,
         Math.min(this.options.deliveryTimeout ?? TaskLimits.FeedbackTimeoutMs, TaskLimits.FeedbackTimeoutMs));
@@ -312,22 +313,33 @@ export class Bridge {
     else if (mode === 'auto') noticeTimer = setTimeout(acknowledge, this.options.backgroundNoticeMs ?? TaskLimits.BackgroundNoticeDelayMs);
     // 流式输出协议的闭包变量：
     let output = '';                          // 已累计的正文，仅保留末尾 24,000 码点
-    let pending = '';                         // 待下一次进度投递的完整快照
     let truncated = false;                    // 累计输出曾超限，最终结果前加截断说明
     let note: string | undefined;             // 附注（如原会话无法恢复，已新建）
-    let reaction: string | undefined;         // Typing 表情 id，任务结束后移除
-    let progressDelivery = Promise.resolve(); // 最近一次进度投递；终态投递前等待其完成
-    let sending = false;                      // 进度投递进行中，防止并发更新同一卡片
     // ── 反馈与流式骨架：Typing 与模型启动并行；进度 250ms 合并一次；deadline 兜底 ──
     const snapshot = () => (truncated ? `（回复过长，以下保留末尾 ${TaskLimits.OutputCodePoints} 字符。）\n\n` : '') + output;
-    const typing = !background && this.channel.startTyping ? this.deliver(async signal => {
-      reaction = await this.channel.startTyping!(m, signal);
-    }, false, Math.min(this.options.deliveryTimeout ?? TaskLimits.FeedbackTimeoutMs, TaskLimits.FeedbackTimeoutMs)) : Promise.resolve(true);
-    const progress = background ? undefined : setInterval(() => {
-      if (!feedbackReady || !pending || sending || a.cancelled) return;
-      const text = pending; pending = ''; sending = true;
-      progressDelivery = this.taskReply(m, { id, state: TaskState.Running, text, note }).then(() => {}).finally(() => { sending = false; });
-    }, TaskLimits.ProgressIntervalMs);
+    const feedbackLimit = Math.min(this.options.deliveryTimeout ?? TaskLimits.FeedbackTimeoutMs, TaskLimits.FeedbackTimeoutMs);
+    let activity = '正在回复';
+    let plainAcknowledged = false;
+    const feedback: TaskFeedback | undefined = background ? undefined : new TaskFeedback({
+      delayMs: this.options.backgroundNoticeMs ?? TaskLimits.BackgroundNoticeDelayMs,
+      ready: () => feedbackReady && !a.cancelled,
+      send: async (text, activity) => {
+        if (!this.channel.task && plainAcknowledged) return true;
+        const sent = await this.deliver(signal => this.channel.task
+          ? this.channel.task(m, { id, state: TaskState.Running, text, activity, note }, signal)
+          : this.channel.send(m, `任务正在执行，完成后通知你。\n任务编号：${id}`, signal), false, feedbackLimit);
+        plainAcknowledged ||= sent; return sent;
+      },
+      startTyping: this.channel.startTyping ? async () => {
+        let reaction: string | undefined;
+        await this.deliver(async signal => {
+          reaction = await this.channel.startTyping!(m, signal);
+          feedback?.typingCreated(reaction);
+        }, false, feedbackLimit);
+        return reaction;
+      } : undefined,
+      stopTyping: reaction => this.deliver(async signal => { await this.channel.stopTyping?.(m, reaction, signal); }, false, feedbackLimit),
+    });
     // 这是包含初始化的总执行时限；长时间无文字输出不会单独触发取消。
     let timedOut = false;
     let promptStarted = false;
@@ -350,12 +362,16 @@ export class Bridge {
         AbortSignal.any([a.opening.signal, AbortSignal.timeout(30000)])), 30000) : undefined;
       a.opening.signal.throwIfAborted();
       const old = this.db.session(this.key(m), this.options.sessionIdleMs ?? TaskLimits.SessionIdleTimeoutMs);
-      featureRun = this.features.begin(m);
+      featureRun = this.features.begin(m, text => {
+        activity = text; feedback?.update(snapshot(), activity);
+      });
       a.session = await this.runtime.open(old, text => {
+        if (executionEnded || a.cancelled) return;
         if (text) a.lastOutputAt = Date.now();
         const characters = Array.from(output + text);
         truncated ||= characters.length > TaskLimits.OutputCodePoints;
-        output = characters.slice(-TaskLimits.OutputCodePoints).join(''); pending = snapshot();
+        output = characters.slice(-TaskLimits.OutputCodePoints).join('');
+        feedback?.update(snapshot(), activity);
       }, async () => {
         if (a.cancelled || this.active !== a) return { outcome: { outcome: 'cancelled' } };
         // bypassPermissions is established before prompt; unexpected requests must not wait on chat.
@@ -389,8 +405,11 @@ export class Bridge {
       if (output) result = `${snapshot()}\n\n（${result}以上为部分输出。）`;
     } finally {
       // 进程清理和结果落盘后交接工作区，飞书投递独立收尾。
-      clearTimeout(deadline); clearInterval(progress); clearTimeout(noticeTimer);
+      clearTimeout(deadline); clearTimeout(noticeTimer);
       executionEnded = true;
+      const notifyCompletion = !background && Date.now() - a.startedAt >=
+        (this.options.backgroundNoticeMs ?? TaskLimits.BackgroundNoticeDelayMs);
+      const progressDelivery = feedback?.stop();
       featureRun?.end();
       executionDone();
       try {
@@ -402,7 +421,10 @@ export class Bridge {
       }
       const changes = featureRun?.state.changeSummary();
       if (changes) result += `\n\n${changes}`;
-      try { this.db.complete(id, status, result); } catch (error) { this.report(error, 'save-result', id); }
+      try { this.db.complete(id, status, result); } catch (error) {
+        this.fatal(error, 'save-result', id);
+        result += '\n\n结果保存失败，服务已停止接收新任务。请保留本条回复并检查存储；不要直接重发已执行的任务。';
+      }
       if (a.session) {
         try {
           const key = this.key(m);
@@ -421,11 +443,10 @@ export class Bridge {
       try {
         await accepted;
         await progressDelivery;
-        await this.result(m, id, result, status, note);
+        await this.result(m, id, result, status, note, notifyCompletion);
       } finally {
         if (this.channel.forgetTask) await this.deliver(async () => { await this.channel.forgetTask!(m, id); }, false, TaskLimits.FeedbackTimeoutMs);
-        await typing;
-        if (reaction && this.channel.stopTyping) await this.deliver(signal => this.channel.stopTyping!(m, reaction!, signal), false, Math.min(this.options.deliveryTimeout ?? TaskLimits.FeedbackTimeoutMs, TaskLimits.FeedbackTimeoutMs));
+        await feedback?.dispose();
         this.log.info({ task: id, status }, 'Task finished');
         this.delivering.delete(a);
         done();

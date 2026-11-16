@@ -8,8 +8,8 @@ import type { Runtime, Inbound } from '../src/types.ts';
 
 const message: Inbound = { account: 'a', chat: 'c', thread: '', user: 'u', id: 'm', text: 'long work' };
 
-test('auto reply defaults to five seconds and supports a ten-second override', () => {
-  assert.equal(baseConfigSchema.parse({ WORKSPACE_ROOT: '.' }).TASK_REPLY_MODE, 'auto');
+test('stream is the default and feedback delay supports five or ten seconds', () => {
+  assert.equal(baseConfigSchema.parse({ WORKSPACE_ROOT: '.' }).TASK_REPLY_MODE, 'stream');
   assert.equal(baseConfigSchema.parse({ WORKSPACE_ROOT: '.' }).TASK_BACKGROUND_NOTICE_MS, 5000);
   assert.equal(baseConfigSchema.parse({ WORKSPACE_ROOT: '.', TASK_BACKGROUND_NOTICE_MS: '10000' }).TASK_BACKGROUND_NOTICE_MS, 10000);
   assert.equal(baseConfigSchema.parse({ WORKSPACE_ROOT: '.', TASK_REPLY_MODE: 'stream' }).TASK_REPLY_MODE, 'stream');
@@ -69,7 +69,7 @@ for (const [duration, noticeDelay] of [[4999, undefined], [5000, undefined], [99
       async send(_m, text) { assert.match(text, /后台/); events.push('notice'); },
       async startTyping() { assert.fail('Auto mode must not show continuous typing'); },
       async task(_m, reply) { assert.equal(reply.state, 'completed'); events.push('result'); },
-    }, { users: ['u'], admins: [], workspace: 'w', taskTimeout: 60000, cancelGrace: 10, backgroundNoticeMs: noticeDelay });
+    }, { users: ['u'], admins: [], workspace: 'w', replyMode: 'auto', taskTimeout: 60000, cancelGrace: 10, backgroundNoticeMs: noticeDelay });
     const run = b.handle(message);
     try {
       await nextTurn(); assert.deepEqual(events, []);
