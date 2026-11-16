@@ -9,7 +9,6 @@ Release Please 根据 Conventional Commits 在发布 PR 中维护此文件，版
 
 ### Features
 
-* stream ACP task activity with adaptive feedback ([90ec69f](https://github.com/maxtanforge/agent-bridge/commit/90ec69f385af51cb6d5909175a1345a7dee16052))
 * stream ACP task activity with adaptive feedback ([a4b37ea](https://github.com/maxtanforge/agent-bridge/commit/a4b37ea94348c05b0076898fc82a270fe8b34c85))
 
 ## [0.3.0](https://github.com/MaxTanForge/agent-bridge/compare/v0.2.0...v0.3.0) (2026-11-13)
