@@ -9,7 +9,6 @@ Release Please 根据 Conventional Commits 在发布 PR 中维护此文件，版
 
 ### Features
 
-* support conversational ACP input and preserve session context ([1a5492a](https://github.com/maxtanforge/agent-bridge/commit/1a5492a79e38d2a1ce096e96faa57fdefc8b8d96))
 * support conversational ACP input and preserve session context ([b216af0](https://github.com/maxtanforge/agent-bridge/commit/b216af0983722701f918ff00f7e095af0e008b25))
 
 
