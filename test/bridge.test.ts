@@ -197,7 +197,7 @@ test('busy workspace queues new task; only owner can cancel', async () => {
   const m: Inbound = { account: 'a', chat: 'c', thread: '', user: 'u', id: '1', text: 'go' };
   const active = b.handle(m);
   await new Promise(r => setTimeout(r, 10));
-  await b.handle({ ...m, id: '2', text: 'busy' });
+  await b.handle({ ...m, id: '2', text: '/queue busy' });
   assert.ok(sent.some(s => s.includes('已加入队列')));
   const queued = db.db.prepare("SELECT id FROM tasks WHERE status='queued'").get()!.id;
   await b.handle({ ...m, id: '3', user: 'v', text: '/cancel' }); assert.equal(cancelled, 0);

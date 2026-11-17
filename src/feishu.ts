@@ -11,7 +11,7 @@ import { errorFacts } from './diagnostics.ts';
 
 const eventSchema = z.object({
   sender: z.object({ sender_type: z.literal('user'), sender_id: z.object({ open_id: z.string().min(1) }) }),
-  message: z.object({ message_id: z.string(), chat_id: z.string(), thread_id: z.string().optional(),
+  message: z.object({ message_id: z.string(), chat_id: z.string(), thread_id: z.string().optional(), parent_id: z.string().optional(),
     chat_type: z.enum(['p2p', 'group']), message_type: z.string(), content: z.string(),
     mentions: z.array(z.object({ key: z.string(), id: z.object({ open_id: z.string().optional() }) })).optional(),
   }),
@@ -19,16 +19,18 @@ const eventSchema = z.object({
 /** 飞书回复消息类型：interactive 为卡片引用，post 为富文本。 */
 const MsgType = { Card: 'interactive', Post: 'post' } as const;
 /**
- * 将飞书消息事件归一化为 Inbound：不符合接入规则（非用户发送、群聊未 @机器人）
- * 返回 undefined；超长/不支持的输入返回带 rejection 的消息，
+ * 将飞书消息事件归一化为 Inbound：非用户、无 @ 且无父消息的群聊事件返回 undefined。
+ * 带父消息的未 @ 回复交给 Bridge 校验本人提问关联；超长/不支持的输入返回带 rejection 的消息，
  * 由 Bridge 回复提示而不执行。附件仅保留元数据，授权排队后再下载。
  */
 export function normalizeInbound(raw: unknown, account: string, bot: string): Inbound | undefined {
   const parsed = eventSchema.safeParse(raw); if (!parsed.success) return;
   const { sender, message: m } = parsed.data;
   const mentions = (m.mentions ?? []).filter(x => x.id.open_id === bot);
-  if (m.chat_type === 'group' && !mentions.length) return;
-  const base = { account, chat: m.chat_id, thread: m.thread_id ?? '', user: sender.sender_id.open_id, id: m.message_id, text: '' };
+  const unmentioned = m.chat_type === 'group' && !mentions.length;
+  if (unmentioned && !m.parent_id) return;
+  const base = { account, chat: m.chat_id, thread: m.thread_id ?? '', user: sender.sender_id.open_id, id: m.message_id, text: '',
+    ...(m.parent_id ? { replyTo: m.parent_id } : {}), ...(unmentioned ? { unmentioned: true } : {}) };
   if (m.message_type === 'image' || m.message_type === 'file') {
     try {
       if (m.content.length > 64000) throw new Error('metadata too large');
@@ -47,7 +49,7 @@ export function normalizeInbound(raw: unknown, account: string, bot: string): In
     if (text.length > 16000) return tooLong();
     for (const mention of mentions) text = text.replaceAll(mention.key, '');
     text = text.trim(); if (!text) return;
-    return { account, chat: m.chat_id, thread: m.thread_id ?? '', user: sender.sender_id.open_id, id: m.message_id, text };
+    return { ...base, text };
   } catch { return; }
 }
 export function normalizeMessage(raw: unknown, account: string, bot: string): Inbound | undefined {
@@ -159,6 +161,14 @@ export class Feishu implements Channel {
       if (response.code !== 0) throw apiDeliveryFailure(response.code);
       return response.data?.message_id;
     } catch (error) { throw deliveryFailure(error); }
+  }
+  async question(m: Inbound, text: string, questionId: string, signal?: AbortSignal) {
+    let content = richPost(text);
+    if (Buffer.byteLength(content) > 28000) {
+      await this.send(m, text, signal);
+      content = richPost('问题内容已分段发送，请回复本条消息回答；/questions 重新查看。');
+    }
+    return this.reply(m, MsgType.Post, content, questionId, signal);
   }
   private async cardApi<T extends { code?: number }>(signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
     try {

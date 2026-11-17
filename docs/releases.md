@@ -55,7 +55,18 @@ Release Please 会据此更新发布 PR。使用 squash merge 时，应确保最
 
 ## 自动检查与镜像发布
 
-普通 PR 和 `main` 提交运行类型检查、测试及 Docker 构建，不登录 GHCR、不推送或签名镜像。Dockerfile 构建阶段另外执行打包和 bundle smoke check。发布仅允许从 `main` 的 workflow 发起；手动选择其他分支时必须保持 `release-tag` 为空。
+当前 workflow 的触发范围如下：
+
+| 操作 | 自动检查与 Docker 行为 | 推送及签名镜像 |
+| --- | --- | --- |
+| 直接推送 `dev`，或 PR 目标为 `dev` | 当前未配置自动 CI，不构建镜像 | 否 |
+| PR 目标为 `main`（包括 `dev → main`） | 类型检查、测试和 Docker 构建，作为合入前验证 | 否 |
+| 普通提交进入 `main` | 类型检查、测试和 Docker 构建；Release Please 创建或更新发布 PR | 否 |
+| 合并发布 PR，由 Release workflow 调用发布任务 | 检出确切版本标签，校验版本、测试并构建镜像 | 是，包含 Cosign 签名和验签 |
+| 手动运行 Docker image，`release-tag` 留空 | 检查所选分支并构建镜像，包括手动选择 `dev` 的情况 | 否 |
+| 在 `main` 手动运行 Docker image，填写已有 `release-tag` | 检出指定标签，重新校验、构建并发布 | 是 |
+
+日常开发可在本地运行 `pnpm typecheck`、`pnpm test`、`pnpm build` 和 `pnpm test:bundle`，不必每次构建 Docker 镜像。Dockerfile 构建阶段会执行打包和 bundle smoke check。没有发布标签的构建不登录 GHCR、不推送或签名镜像。发布仅允许从 `main` 的 workflow 发起；手动选择其他分支时必须保持 `release-tag` 为空。自动生成的发布 PR 是否触发 CI，还受前述 GitHub token 事件限制影响；若运行显示需要批准，需先处理运行提示并检查最终结果。
 
 Release Please 创建 Release 后，调用 Docker image 工作流并传入确切的标签；测试和构建都检出该标签，而非随后变化的 `main`。发布前检查：
 
@@ -94,7 +105,7 @@ cosign verify "$IMAGE" \
 
 ## 重试、升级与回滚
 
-如果 GitHub Release 已创建，但测试、网络或 GHCR 推送失败，在 Actions → Docker image → Run workflow 中选择 `main`，将 `release-tag` 填为已有的 `v0.2.0`。工作流会检出该标签、重新验证并发布；留空只检查当前所选分支，不发布。不要移动已有版本标签来发布不同代码。
+如果 GitHub Release 已创建，但测试、网络或 GHCR 推送失败，在 Actions → Docker image → Run workflow 中选择 `main`，将 `release-tag` 填为需要重试的已有标签，例如 `v0.4.0`。工作流会检出该标签、重新验证并发布；留空会检查并构建当前所选分支，但不推送镜像。不要移动已有版本标签来发布不同代码。
 
 若镜像已推送而签名失败，该镜像可能已可拉取，但发布尚未完成。优先在原运行中 Re-run failed jobs，对同一 digest 补签并验证；手动重新运行完整发布会重建镜像，digest 可能改变，应重新验证最终摘要里的 digest。
 

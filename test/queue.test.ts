@@ -44,7 +44,7 @@ test('queued cancellation is persisted before acknowledgement and confirmed afte
   const first = f.bridge.handle(message);
   try {
     await nextTurn();
-    const enqueue = f.bridge.handle({ ...message, id: 'second' });
+    const enqueue = f.bridge.handle({ ...message, id: 'second', text: '/queue first' });
     const queued = f.queued()[0];
     const cancel = f.bridge.handle({ ...message, id: 'cancel-all', text: '/cancel all' });
     await nextTurn();
@@ -59,13 +59,32 @@ test('queued cancellation is persisted before acknowledgement and confirmed afte
   } finally { resolve(); await f.close(); }
 });
 
-test('busy messages execute FIFO once after cleanup, preserving session context', async () => {
+test('successful task closes its runtime before handing the workspace to queued work', async () => {
+  const f = fixture(); const first = f.bridge.handle(message);
+  const cleanup = Promise.withResolvers<void>();
+  let closing = false;
+  try {
+    await nextTurn();
+    f.runtime.stop = async () => { closing = true; await cleanup.promise; };
+    await f.bridge.handle({ ...message, id: 'next', text: '/queue second' });
+    f.finish(); await nextTurn();
+    assert.equal(closing, true);
+    assert.deepEqual(f.prompts, ['first']);
+    assert.equal(f.bridge.active?.message.id, 'first');
+    cleanup.resolve(); await first; await nextTurn();
+    assert.deepEqual(f.prompts, ['first', 'second']);
+    assert.deepEqual(f.sessions, [undefined, 's-1']);
+    const done = f.bridge.active!.done; f.finish(); await done;
+  } finally { cleanup.resolve(); f.runtime.stop = async () => { f.finish(); }; await f.close(); }
+});
+
+test('explicit queued messages execute FIFO once after cleanup, preserving session context', async () => {
   const f = fixture(); const first = f.bridge.handle(message);
   try {
     await nextTurn();
-    await f.bridge.handle({ ...message, id: 'second', text: 'second' });
-    await f.bridge.handle({ ...message, id: 'second', text: 'second' });
-    await f.bridge.handle({ ...message, id: 'third', text: 'third' });
+    await f.bridge.handle({ ...message, id: 'second', text: '/queue second' });
+    await f.bridge.handle({ ...message, id: 'second', text: '/queue second' });
+    await f.bridge.handle({ ...message, id: 'third', text: '/queue third' });
     assert.equal(f.queued().length, 2); assert.deepEqual(f.prompts, ['first']);
     assert.equal(f.sent.filter(s => s.text.includes('已加入队列')).length, 2);
     f.finish(); await first; await nextTurn();
@@ -82,7 +101,7 @@ test('queue visibility and individual cancellation stay in account/chat/thread a
   const f = fixture(); void f.bridge.handle(message);
   try {
     await nextTurn();
-    await f.bridge.handle({ ...message, id: 'private', text: 'private queued task' });
+    await f.bridge.handle({ ...message, id: 'private', text: '/queue private queued task' });
     const id = f.queued()[0].id;
     for (const [i, override] of [{ user: 'v' }, { user: 'admin', thread: 'other' }, { account: 'other' }, { chat: 'other' }].entries()) {
       await f.bridge.handle({ ...message, ...override, id: `list-${i}`, text: '/queue' });
@@ -104,8 +123,8 @@ test('cancel all clears only caller queue; cancel current continues the next tas
   const f = fixture(); const first = f.bridge.handle(message);
   try {
     await nextTurn();
-    await f.bridge.handle({ ...message, id: 'own', text: 'own queued' });
-    await f.bridge.handle({ ...message, user: 'v', id: 'other', text: 'other queued' });
+    await f.bridge.handle({ ...message, id: 'own', text: '/queue own queued' });
+    await f.bridge.handle({ ...message, user: 'v', id: 'other', text: '/queue other queued' });
     await f.bridge.handle({ ...message, id: 'clear', text: '/cancel all' });
     assert.equal(f.queued().length, 1);
     await f.bridge.handle({ ...message, id: 'cancel-current', text: '/cancel' });
@@ -121,12 +140,12 @@ test('queue limit and admission failure do not create phantom or duplicate work'
     await nextTurn();
     const task = f.db.task;
     f.db.task = () => { throw new Error('disk failure'); };
-    await f.bridge.handle({ ...message, id: 'retry', text: 'retry' });
+    await f.bridge.handle({ ...message, id: 'retry', text: '/queue retry' });
     assert.equal(f.queued().length, 0);
     f.db.task = task;
-    await f.bridge.handle({ ...message, id: 'retry', text: 'retry' });
+    await f.bridge.handle({ ...message, id: 'retry', text: '/queue retry' });
     assert.equal(f.queued().length, 1);
-    await f.bridge.handle({ ...message, id: 'full', text: 'overflow' });
+    await f.bridge.handle({ ...message, id: 'full', text: '/queue overflow' });
     assert.match(f.sent.at(-1)!.text, /队列已满/); assert.equal(f.queued().length, 1);
     await f.bridge.handle({ ...message, id: 'new', text: '/new' });
     assert.match(f.sent.at(-1)!.text, /取消|完成/);
@@ -138,7 +157,7 @@ test('control commands bypass a full queue without becoming model tasks', async 
   const f = fixture(1); const first = f.bridge.handle(message);
   try {
     await nextTurn();
-    await f.bridge.handle({ ...message, id: 'pending', text: 'pending work' });
+    await f.bridge.handle({ ...message, id: 'pending', text: '/queue pending work' });
     for (const [text, response] of [
       ['/status', /当前任务/], ['/queue', /pending work/],
       ['/result', /尚无可取回的结果/], ['/new', /执行中或排队任务/],
@@ -150,7 +169,7 @@ test('control commands bypass a full queue without becoming model tasks', async 
     await f.bridge.handle({ ...message, id: 'cancel-running', text: '/cancel' });
     await first; await nextTurn();
     assert.deepEqual(f.prompts, ['first', 'pending work']);
-    await f.bridge.handle({ ...message, id: 'pending-again', text: 'another pending' });
+    await f.bridge.handle({ ...message, id: 'pending-again', text: '/queue another pending' });
     await f.bridge.handle({ ...message, id: 'clear', text: '/cancel all' });
     assert.equal(f.queued().length, 0);
     assert.deepEqual(f.prompts, ['first', 'pending work']);
@@ -162,7 +181,7 @@ test('execution failure drains queue but failed process cleanup interrupts it', 
     const f = fixture(); const first = f.bridge.handle(message);
     try {
       await nextTurn();
-      await f.bridge.handle({ ...message, id: 'next', text: 'next' });
+      await f.bridge.handle({ ...message, id: 'next', text: '/queue next' });
       const id = f.queued()[0].id;
       if (cleanupFails) f.runtime.stop = async () => { throw new Error('process still alive'); };
       f.fail(); await first; await nextTurn();
@@ -180,7 +199,7 @@ test('execution failure drains queue but failed process cleanup interrupts it', 
 test('stopping interrupts queued requests with retrievable results without starting them', async () => {
   const f = fixture(); void f.bridge.handle(message);
   try {
-    await nextTurn(); await f.bridge.handle({ ...message, id: 'queued', text: 'queued' });
+    await nextTurn(); await f.bridge.handle({ ...message, id: 'queued', text: '/queue queued' });
     const id = f.queued()[0].id;
     await f.bridge.stop();
     assert.deepEqual(f.prompts, ['first']); assert.equal(f.db.taskStatus(id), 'interrupted');
@@ -207,7 +226,7 @@ test('final delivery releases the workspace without changing FIFO execution', as
   f.bridge.channel.task = async m => { if (m.id === 'first') await delivery; };
   const first = f.bridge.handle(message);
   try {
-    await nextTurn(); await f.bridge.handle({ ...message, user: 'v', id: 'second', text: 'second' });
+    await nextTurn(); await f.bridge.handle({ ...message, user: 'v', id: 'second', text: '/queue second' });
     const firstId = f.bridge.active!.id;
     f.finish(); await nextTurn(); assert.deepEqual(f.prompts, ['first', 'second']);
     assert.equal(f.db.latestResult(f.bridge.key(message))?.delivery, 'pending');
@@ -215,7 +234,7 @@ test('final delivery releases the workspace without changing FIFO execution', as
     assert.match(f.sent.at(-1)!.text, /结果发送与清理中/);
     await f.bridge.handle({ ...message, id: 'cancel', text: `/cancel ${firstId}` });
     assert.equal(f.bridge.active?.phase, 'executing');
-    await f.bridge.handle({ ...message, id: 'third', text: 'third' });
+    await f.bridge.handle({ ...message, id: 'third', text: '/queue third' });
     const second = f.bridge.active!.done; f.finish(); await second; await nextTurn();
     assert.deepEqual(f.prompts, ['first', 'second', 'third']);
     releaseDelivery(); await first;
@@ -235,9 +254,9 @@ test('a slow enqueue acknowledgement does not delay prompts but precedes that ta
   const first = f.bridge.handle(message);
   try {
     await nextTurn();
-    const queued = f.bridge.handle({ ...message, id: 'second', text: 'second' });
+    const queued = f.bridge.handle({ ...message, id: 'second', text: '/queue second' });
     const secondId = f.queued()[0].id;
-    await f.bridge.handle({ ...message, id: 'third', text: 'third' });
+    await f.bridge.handle({ ...message, id: 'third', text: '/queue third' });
     f.finish(); await first; await nextTurn();
     assert.deepEqual(f.prompts, ['first', 'second']);
     const second = f.bridge.active!.done;
@@ -266,9 +285,9 @@ test('shutdown interrupts waiting work and waits for in-flight notifications', a
   const first = f.bridge.handle(message);
   try {
     await nextTurn();
-    await f.bridge.handle({ ...message, id: 'second', text: 'second' });
+    await f.bridge.handle({ ...message, id: 'second', text: '/queue second' });
     f.finish(); await nextTurn();
-    const queued = f.bridge.handle({ ...message, id: 'queued', text: 'queued' });
+    const queued = f.bridge.handle({ ...message, id: 'queued', text: '/queue queued' });
     const id = f.queued()[0].id;
     let stopped = false;
     const shutdown = f.bridge.stop().then(() => { stopped = true; });
@@ -284,7 +303,7 @@ test('shutdown interrupts waiting work and waits for in-flight notifications', a
 test('database failure while starting queued task stops dispatch and records interruption', async () => {
   const f = fixture(); const first = f.bridge.handle(message);
   try {
-    await nextTurn(); await f.bridge.handle({ ...message, id: 'queued', text: 'queued' });
+    await nextTurn(); await f.bridge.handle({ ...message, id: 'queued', text: '/queue queued' });
     const id = f.queued()[0].id;
     f.db.startQueued = () => { throw new Error('storage unavailable'); };
     f.finish(); await first; await nextTurn();
@@ -300,7 +319,7 @@ test('result recovers later-completed answer even when a newer queued task was c
   try {
     await nextTurn();
     const runningId = f.db.db.prepare("SELECT id FROM tasks WHERE status='running'").get()!.id;
-    await f.bridge.handle({ ...message, id: 'queued', text: 'queued' });
+    await f.bridge.handle({ ...message, id: 'queued', text: '/queue queued' });
     await f.bridge.handle({ ...message, id: 'cancel-queued', text: '/cancel all' });
     f.finish(); await first;
     const result = f.db.latestResult(f.bridge.key(message))!;
@@ -330,7 +349,7 @@ test('result retrieves an older failed delivery by ID and keeps results scoped t
   try {
     await nextTurn();
     const firstId = f.bridge.active!.id;
-    await f.bridge.handle({ ...message, id: 'second', text: 'second' });
+    await f.bridge.handle({ ...message, id: 'second', text: '/queue second' });
     f.finish(); await nextTurn();
     const second = f.bridge.active!.done;
     f.finish(); await second;

@@ -4,7 +4,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { DeliveryState, TaskLimits, TaskState, type TaskTerminalState } from './task.ts';
+import { DeliveryState, TaskState, type TaskTerminalState } from './task.ts';
 import type { RuntimeHooks } from './types.ts';
 type Preferences = Pick<RuntimeHooks, 'mode' | 'model' | 'effort'>;
 
@@ -110,11 +110,11 @@ export class Store {
   taskStatus(id: string): TaskState | undefined {
     return (this.db.prepare('SELECT status FROM tasks WHERE id=?').get(id) as { status: TaskState } | undefined)?.status;
   }
-  /** 仅恢复未过闲置期的会话；读取本身不延长有效期。 */
-  session(id: string, idleMs: number = TaskLimits.SessionIdleTimeoutMs): string | undefined {
+  /** 闲置回收运行资源，不删除上下文绑定；旧版无时间戳映射仍需显式恢复。 */
+  session(id: string): string | undefined {
     const row = this.db.prepare('SELECT acp,last_used_at FROM sessions WHERE id=?').get(id) as { acp: string; last_used_at: number | null } | undefined;
     if (!row) return;
-    if (row.last_used_at === null || Date.now() - row.last_used_at >= idleMs) { this.forget(id); return; }
+    if (row.last_used_at === null) { this.forget(id); return; }
     return row.acp;
   }
   /** 保存或更新会话映射。 */
@@ -154,9 +154,6 @@ export class Store {
     if (value === undefined) delete preferences[name];
     else Object.assign(preferences, { [name]: value });
     this.db.prepare('INSERT OR REPLACE INTO session_preferences VALUES (?,?)').run(owner, JSON.stringify(preferences));
-  }
-  expireSessions(idleMs: number) {
-    this.db.prepare('DELETE FROM sessions WHERE last_used_at IS NULL OR last_used_at<=?').run(Date.now() - idleMs);
   }
   /** 删除会话映射（/new）；不删除任务结果与 Adapter 侧历史。 */
   forget(id: string) { this.db.prepare('DELETE FROM sessions WHERE id=?').run(id); }

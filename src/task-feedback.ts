@@ -16,6 +16,8 @@ export class TaskFeedback {
   private activity = '';
   private dirty = false;
   private sending = false;
+  private failures = 0;
+  private retry?: ReturnType<typeof setTimeout>;
   private reaction?: string;
   private hidden = false;
   private removed = new Set<string>();
@@ -49,17 +51,26 @@ export class TaskFeedback {
   }
   update(text: string, activity: string) {
     if (this.ended || (text === this.text && activity === this.activity)) return;
+    if (this.failures >= 4) this.failures = 0;
     this.text = text; this.activity = activity; this.dirty = true;
   }
   private flush() {
-    if (this.ended || !this.dirty || this.sending || !this.ports.ready()) return;
+    if (this.ended || !this.dirty || this.sending || this.retry || !this.ports.ready()) return;
     this.dirty = false; this.sending = true;
     this.delivery = this.ports.send(this.text, this.activity).then(sent => {
-      if (sent) { this.visible = true; this.hideTyping(); }
-    }, () => {}).finally(() => { this.sending = false; });
+      if (sent) { this.failures = 0; this.visible = true; this.hideTyping(); }
+      else this.retryFeedback();
+    }, () => this.retryFeedback()).finally(() => { this.sending = false; });
+  }
+  private retryFeedback() {
+    if (this.ended || ++this.failures > 3) return;
+    this.dirty = true;
+    this.retry = setTimeout(() => {
+      this.retry = undefined; this.flush();
+    }, 1000 * 2 ** (this.failures - 1));
   }
   stop() {
-    this.ended = true; clearInterval(this.interval); clearTimeout(this.fallback);
+    this.ended = true; clearInterval(this.interval); clearTimeout(this.fallback); clearTimeout(this.retry);
     return this.delivery;
   }
   async dispose() {

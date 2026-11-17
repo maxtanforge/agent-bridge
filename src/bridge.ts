@@ -9,6 +9,8 @@ import { AgentFeatures } from './agent-features.ts';
 import { TaskFeedback } from './task-feedback.ts';
 import { nativeCommand } from './commands.ts';
 import { AttachmentError } from './attachments.ts';
+import { ConversationInputs } from './conversation-inputs.ts';
+import { SessionRestoreError } from './runtime.ts';
 import { ChatCommand, DeliveryState, isControlCommand, StopReason, incompleteReasonText, TaskState, TaskPhase, TaskPhaseLabel, TaskLimits, elapsedText } from './task.ts';
 
 /** 任务编排核心：用户鉴权、命令、单任务互斥与 FIFO 队列、会话、进度和取消。 */
@@ -33,7 +35,7 @@ type Options = {
   replyMode?: 'auto' | 'background' | 'stream';
   /** stream 无可见反馈时的兜底 / auto 后台通知延迟。 */
   backgroundNoticeMs?: number;
-  /** 会话及空闲 Adapter 的闲置回收期限，默认四小时。 */
+  /** 空闲 Adapter 资源的回收期限，默认四小时；保留会话绑定。 */
   sessionIdleMs?: number;
   /** 通知入口停止服务，由部署环境重启实例。 */
   onFatal?: () => void;
@@ -60,6 +62,7 @@ type Active = {
   /** cancel() 的清理 Promise；重复取消共享同一轮清理。 */
   cancellation?: Promise<void>;
   runtimeCleanup?: Promise<void>;
+  inputs?: ConversationInputs;
 };
 export class Bridge {
   db: Store; runtime: Runtime; channel: Channel; options: Options; log: DiagnosticLogger;
@@ -75,6 +78,8 @@ export class Bridge {
     this.db = db; this.runtime = runtime; this.options = options;
     this.channel = channel; this.log = log;
     this.features = new AgentFeatures(db, runtime, { workspace: options.workspace, key: m => this.key(m), send: (m, text) => this.send(m, text),
+      steer: m => this.supplement(m),
+      question: (m, text, id) => this.question(m, text, id),
       busy: key => !!(this.active && this.key(this.active.message) === key) || this.queue.some(entry => this.key(entry.message) === key) });
   }
   /** 会话键：应用+聊天+话题+用户+工作区；不同用户/话题不共享 Agent 会话。 */
@@ -111,6 +116,12 @@ export class Bridge {
   /** 发送富文本；retry 时对可恢复错误重试。 */
   private send(m: Inbound, text: string, retry = false) {
     return this.deliver(signal => this.channel.send(m, text, signal), retry);
+  }
+  private async question(m: Inbound, text: string, id: string): Promise<boolean | string> {
+    if (!this.channel.question) return this.send(m, text);
+    let reference: string | undefined;
+    const sent = await this.deliver(async signal => { reference = await this.channel.question!(m, text, id, signal); });
+    return sent ? reference ?? true : false;
   }
   /** 发送任务回复（流式卡片或降级富文本）；渠道无 task 能力时退回 send。 */
   private taskReply(m: Inbound, reply: TaskReply, retry = false) {
@@ -190,8 +201,6 @@ export class Bridge {
       this.idleTimer = undefined;
       if (this.stopping || this.active || this.queue.length) return;
       this.idleCleanup = (async () => {
-        // 在异步进程清理前过期映射，避免删除随后新任务保存的会话。
-        this.db.expireSessions(idleMs);
         await this.runtime.stop();
       })().catch(error => { this.fatal(error, 'idle-cleanup'); });
     }, idleMs);
@@ -209,13 +218,25 @@ export class Bridge {
       `执行时限：${elapsedText(this.options.taskTimeout)}`,
       active.lastOutputAt === undefined ? '暂未收到文字进展。' : `最近文本输出：${elapsedText(now - active.lastOutputAt)}前`,
       this.features.brief(this.key(active.message)),
+      active.inputs?.count ? `待投递补充：${active.inputs.count} 条（属于当前任务，/cancel 一并停止）。` : '',
     ].filter(Boolean).join('\n');
   }
   async handle(m: Inbound) {
     if (this.stopping || !this.options.users.includes(m.user)) return;
+    const questionReply = this.features.interactions.matches(this.key(m), m.replyTo);
+    if (m.unmentioned && !questionReply) return;
     // ── 鉴权与去重：控制命令独立去重，普通任务在入队/接纳事务中去重 ──
     const messageKey = JSON.stringify(['feishu', m.account, m.id]);
-    const control = m.rejection || isControlCommand(m.text);
+    const queueInput = /^\/queue\s+([\s\S]*)$/.exec(m.text);
+    const enqueue = !!queueInput;
+    if (queueInput) {
+      m = { ...m, text: queueInput[1].trim() };
+      if (!m.text) {
+        try { if (!this.db.claim(messageKey)) return; } catch (error) { this.report(error, 'claim'); return; }
+        await this.send(m, '用法：/queue <任务内容> 显式排队；单独 /queue 查看队列。'); return;
+      }
+    }
+    const control = m.rejection || (!enqueue && isControlCommand(m.text));
     if (control) {
       try { if (!this.db.claim(messageKey)) return; } catch (error) { this.report(error, 'claim'); return; }
       if (m.rejection) { await this.send(m, m.rejection); return; }
@@ -263,6 +284,23 @@ export class Bridge {
         return;
       }
     }
+    // ACP answers take precedence over task admission, but never bypass owner scope or message deduplication.
+    if (!enqueue && !m.text.startsWith('/') && (questionReply || this.features.interactions.count(this.key(m)) > 0)) {
+      try { if (!this.db.claim(messageKey)) return; } catch (error) { this.report(error, 'claim'); return; }
+      const questionId = this.features.interactions.target(this.key(m), m.replyTo);
+      const response = m.attachment ? '当前正在等待文字回答，请直接回复选项或文字；本附件未加入队列。'
+        : this.features.interactions.reply(this.key(m), m.text, m.replyTo);
+      if (response && questionId && this.features.interactions.has(this.key(m), questionId)) {
+        await this.features.interactions.notify(this.key(m), questionId, response, (text, id) => this.question(m, text, id));
+      } else if (response) await this.send(m, response);
+      return;
+    }
+    if (!enqueue && this.active) {
+      try { if (!this.db.claim(messageKey)) return; } catch (error) { this.report(error, 'claim'); return; }
+      try { await this.supplement(m); }
+      catch (error) { this.report(error, 'automatic-steering'); await this.send(m, '引导未确认，本条未自动重试或入队；请查看 /status。'); }
+      return;
+    }
     if (this.active || this.queue.length) {
       if (this.queue.length >= (this.options.queueLimit ?? TaskLimits.MaxQueuedTasks)) {
         try { if (!this.db.claim(messageKey)) return; } catch (error) { this.report(error, 'claim'); return; }
@@ -285,6 +323,14 @@ export class Bridge {
     catch (error) { this.report(error, 'accept-task', id); await this.send(m, '任务未创建，请稍后重新发送。'); return; }
     return this.execute(m, id);
   }
+  private async supplement(m: Inbound) {
+    const a = this.active;
+    if (!a) { await this.send(m, '当前没有正在执行的本人任务；请直接发送普通消息继续会话。'); return; }
+    if (this.key(a.message) !== this.key(m)) {
+      await this.send(m, '工作区正在执行其他会话的任务，不能引导。请用 /queue <任务内容> 显式排队。'); return;
+    }
+    await a.inputs?.accept(m);
+  }
   private async execute(m: Inbound, id: string, queuedAcknowledgement?: Promise<boolean>) {
     clearTimeout(this.idleTimer); this.idleTimer = undefined;
     let done!: () => void; let executionDone!: () => void;
@@ -293,6 +339,19 @@ export class Bridge {
       startedAt: Date.now(), phase: TaskPhase.Starting,
       done: new Promise<void>(r => { done = r; }), executionDone: new Promise<void>(r => { executionDone = r; }) };
     this.active = a;
+    a.inputs = new ConversationInputs({
+      signal: a.opening.signal,
+      prepare: async message => {
+        if (!this.channel.prepare) throw new AttachmentError('当前渠道不支持附件。');
+        return bounded(this.channel.prepare(message, AbortSignal.any([a.opening.signal, AbortSignal.timeout(30000)])), 30000, a.opening.signal);
+      },
+      steer: async input => {
+        a.opening.signal.throwIfAborted();
+        if (this.active !== a || !a.session || !this.runtime.steer) throw new Error('Steering unavailable');
+        return bounded(this.runtime.steer(a.session, input.message.text, input.attachments), 30000, a.opening.signal);
+      },
+      reply: (message, text) => this.send(message, text),
+    });
     const mode = this.options.replyMode ?? 'stream';
     const background = mode !== 'stream';
     // 回执与模型启动并行；最终结果等待回执结束，避免完成通知排在回执之前。
@@ -314,7 +373,7 @@ export class Bridge {
     // 流式输出协议的闭包变量：
     let output = '';                          // 已累计的正文，仅保留末尾 24,000 码点
     let truncated = false;                    // 累计输出曾超限，最终结果前加截断说明
-    let note: string | undefined;             // 附注（如原会话无法恢复，已新建）
+    const note: string | undefined = undefined; // 任务投递附注
     // ── 反馈与流式骨架：Typing 与模型启动并行；进度 250ms 合并一次；deadline 兜底 ──
     const snapshot = () => (truncated ? `（回复过长，以下保留末尾 ${TaskLimits.OutputCodePoints} 字符。）\n\n` : '') + output;
     const feedbackLimit = Math.min(this.options.deliveryTimeout ?? TaskLimits.FeedbackTimeoutMs, TaskLimits.FeedbackTimeoutMs);
@@ -352,7 +411,7 @@ export class Bridge {
     let status: TaskReply['state'] = TaskState.Failed; let result = '任务未正常完成。';
     let featureRun: ReturnType<AgentFeatures['begin']> | undefined;
     this.log.info({ task: id, stage: TaskState.Running }, 'Task started');
-    // ── 执行：恢复或新建会话 → 免审批模式 → 一次 prompt；文本增量经回调进入 output ──
+    // ── 执行：恢复或新建会话 → 免审批模式 → prompt 与已确认未投递的补充 ──
     try {
       await this.idleCleanup;
       if (this.stopping) throw new Error('Service stopped during idle cleanup');
@@ -361,7 +420,7 @@ export class Bridge {
       const attachments = m.attachment ? await bounded(this.channel.prepare!(m,
         AbortSignal.any([a.opening.signal, AbortSignal.timeout(30000)])), 30000) : undefined;
       a.opening.signal.throwIfAborted();
-      const old = this.db.session(this.key(m), this.options.sessionIdleMs ?? TaskLimits.SessionIdleTimeoutMs);
+      const old = this.db.session(this.key(m));
       featureRun = this.features.begin(m, text => {
         activity = text; feedback?.update(snapshot(), activity);
       });
@@ -379,13 +438,28 @@ export class Bridge {
         return { outcome: { outcome: 'cancelled' } };
       }, a.opening.signal, featureRun.hooks);
       if (a.cancelled) throw new Error('cancelled');
+      if (old && old !== a.session) throw new SessionRestoreError(old);
       this.db.saveSession(this.key(m), a.session);
-      if (old && old !== a.session) note = '原会话无法恢复，已创建新会话。';
       if (a.cancelled) throw new Error('cancelled');
       a.phase = TaskPhase.Executing;
       featureRun.attach(a.session);
       promptStarted = true;
-      const reason = await this.runtime.prompt(a.session, m.text, attachments);
+      let reason: string;
+      let input = { message: m, attachments };
+      for (;;) {
+        a.opening.signal.throwIfAborted();
+        const prompt = this.runtime.prompt(a.session, input.message.text, input.attachments);
+        a.inputs.startTurn();
+        try { reason = await prompt; }
+        finally { await a.inputs.endTurn(); }
+        if (a.cancelled || reason !== StopReason.EndTurn) break;
+        let next;
+        // No await on the empty-buffer boundary: admission and closing stay atomic.
+        while (!a.cancelled && a.inputs.count && !(next = await a.inputs.next())) { /* failed attachments are reported separately */ }
+        if (!next) break;
+        input = { message: next.message, attachments: next.attachments };
+        if (output) output += '\n\n';
+      }
       a.cancelled ||= reason === StopReason.Cancelled;
       status = a.cancelled ? TaskState.Cancelled : reason === StopReason.EndTurn ? TaskState.Completed : TaskState.Failed;
       result = snapshot() || (a.cancelled ? cancellationText() : '没有文本输出。');
@@ -399,6 +473,7 @@ export class Bridge {
       this.report(error, 'execute', id);
       status = a.cancelled ? TaskState.Cancelled : TaskState.Failed;
       if (a.cancelled) result = cancellationText();
+      else if (error instanceof SessionRestoreError) result = `原会话恢复失败，本条尚未发送给 Claude。已保留会话绑定；可重新发送以重试恢复，或先用 /new 明确新开会话。\n\n未执行的输入：\n${m.text}`;
       else if (error instanceof AttachmentError) result = error.message;
       else if (promptStarted) result = '运行中断，任务未正常完成。请检查工作区中的已有改动，再决定是否重试。';
       else result = '任务准备失败，尚未发送给 Claude。请检查运行环境后重新发送。';
@@ -407,13 +482,17 @@ export class Bridge {
       // 进程清理和结果落盘后交接工作区，飞书投递独立收尾。
       clearTimeout(deadline); clearTimeout(noticeTimer);
       executionEnded = true;
+      const undelivered = a.inputs.close();
+      if (undelivered) result += `\n\n当前任务结束，${undelivered} 条待投递补充未执行；未转入独立任务队列。`;
       const notifyCompletion = !background && Date.now() - a.startedAt >=
         (this.options.backgroundNoticeMs ?? TaskLimits.BackgroundNoticeDelayMs);
       const progressDelivery = feedback?.stop();
       featureRun?.end();
       executionDone();
       try {
-        if (a.cancelled || status === TaskState.Failed) await this.stopRuntime(a);
+        // ACP v1 prompt completion does not guarantee background work is quiescent.
+        // Close this task's process before handing off; the persisted session restores context.
+        await this.stopRuntime(a);
       } catch (error) {
         this.fatal(error, 'cleanup', id);
         status = TaskState.Failed;

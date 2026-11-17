@@ -19,6 +19,7 @@ services:
       FEISHU_BOT_OPEN_ID: ${FEISHU_BOT_OPEN_ID:-}
       # Also accepted in QR mode: overrides the scanning user as the allowed user.
       ALLOWED_USERS: ${ALLOWED_USERS:-}
+      ADMIN_USERS: ${ADMIN_USERS:-}
       # true lets the first-scan confirm page also offer choosing an existing app.
       FEISHU_SELECT_EXISTING_APP: ${FEISHU_SELECT_EXISTING_APP:-false}
       # Container path; intentionally independent of local Node's WORKSPACE_ROOT in .env.
@@ -26,6 +27,7 @@ services:
       WORKSPACE_ROOT: /data/workspace
       WORKSPACE_PROJECT: ${WORKSPACE_PROJECT:-.}
       TASK_TIMEOUT_MS: ${TASK_TIMEOUT_MS:-7200000}
+      CANCEL_GRACE_MS: ${CANCEL_GRACE_MS:-5000}
       TASK_REPLY_MODE: ${TASK_REPLY_MODE:-stream}
       TASK_BACKGROUND_NOTICE_MS: ${TASK_BACKGROUND_NOTICE_MS:-5000}
       SESSION_IDLE_TIMEOUT_MS: ${SESSION_IDLE_TIMEOUT_MS:-14400000}

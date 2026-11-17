@@ -15,6 +15,10 @@ export interface Inbound {
   user: string;
   /** 飞书 message_id；用于去重、表情反馈与回复定位。 */
   id: string;
+  /** Platform parent message, used only to resolve an owner-scoped question. */
+  replyTo?: string;
+  /** Group reply without a bot mention: Bridge accepts only a known question reference. */
+  unmentioned?: boolean;
   /** 去除 mention 占位后的指令文本；控制命令（/cancel 等）原样进入。 */
   text: string;
   /** 非空表示输入被拒绝：仅以该文案回复用户，绝不进入 Agent 执行。 */
@@ -39,6 +43,7 @@ export interface TaskReply {
 /** Bridge 对消息渠道的依赖；生产实现见 feishu.ts，测试以内联替身满足。 */
 export type PromptAttachment = { type: 'image'; data: string; mimeType: string } | { type: 'text'; text: string };
 export interface Channel {
+  question?(message: Inbound, text: string, questionId: string, signal?: AbortSignal): Promise<string | undefined>;
   prepare?(message: Inbound, signal: AbortSignal): Promise<PromptAttachment[]>;
   /** 发送富文本消息（自动分片）；signal 中止后停止发送剩余分片。 */
   send(message: Inbound, text: string, signal?: AbortSignal): Promise<void>;
@@ -73,7 +78,7 @@ export interface Runtime {
    */
   open(oldSessionId: string | undefined, onProgress: (text: string) => void,
     onPermission: (request: RequestPermissionRequest) => Promise<RequestPermissionResponse>, signal?: AbortSignal, hooks?: RuntimeHooks): Promise<string>;
-  steer?(session: string, text: string): Promise<'injected' | 'promptRequired'>;
+  steer?(session: string, text: string, attachments?: PromptAttachment[]): Promise<'injected' | 'promptRequired'>;
   /** 在已建立会话上执行一轮 prompt，等整轮结束并返回 stopReason。 */
   prompt(session: string, text: string, attachments?: PromptAttachment[]): Promise<string>;
   /** 通知 Agent 取消当前执行；不等待确认，超时由 stop() 强制清理兜底。 */

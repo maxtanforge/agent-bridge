@@ -6,6 +6,7 @@ export const object = (value: unknown): Record<string, unknown> => value !== nul
 const text = (value: unknown, max = 240) => typeof value === 'string' ? Array.from(value).slice(0, max).join('') : '';
 const list = (value: unknown): unknown[] => Array.isArray(value) ? value : [];
 type Tool = { title: string; status: string; files: Set<string> };
+const activeTool = (tool: Tool) => tool.status === 'pending' || tool.status === 'in_progress';
 
 export class AgentState {
   private readonly workspace?: string;
@@ -47,7 +48,10 @@ export class AgentState {
           this.diffFiles.add(name);
         }
         this.tools.set(id, { title: text(u.title) || previous?.title || '工具', status, files });
-        while (this.tools.size > 30) this.tools.delete(this.tools.keys().next().value!);
+        while (this.tools.size > 30) {
+          const finished = [...this.tools].find(([, tool]) => !activeTool(tool));
+          this.tools.delete(finished?.[0] ?? this.tools.keys().next().value!);
+        }
         break;
       }
       case 'plan': this.plan = list(u.entries).slice(0, 50).map(object).map(e => ({ content: text(e.content), status: text(e.status, 40) })); break;
@@ -75,7 +79,11 @@ export class AgentState {
       values: list(o.options).flatMap(item => { const v = object(item); return Array.isArray(v.options) ? v.options : [v]; }).slice(0, 50).map(object).map(v => text(v.value, 100)).filter(Boolean) }));
   }
   commandsText() { return this.commands.length ? this.commands.map(c => `/${c.name.replace(/^\//, '')} — ${c.description}`).join('\n') : '尚未收到当前会话的 Claude 命令列表；先运行一次任务。'; }
-  toolsText() { return this.tools.size ? [...this.tools.values()].slice(-10).map(t => `${t.title}：${t.status}`).join('\n') : '尚未收到工具执行事件。'; }
+  toolsText() {
+    const tools = [...this.tools.values()];
+    return tools.length ? [...tools.filter(activeTool).reverse(), ...tools.filter(t => !activeTool(t)).reverse()]
+      .slice(0, 10).map(t => `${t.title}：${t.status}`).join('\n') : '尚未收到工具执行事件。';
+  }
   brief() { const t = [...this.tools.values()].at(-1); return t ? `最近工具：${t.title}（${t.status}）` : ''; }
   activityText() {
     const active = [...this.tools.values()].filter(t => t.status === 'pending' || t.status === 'in_progress');
