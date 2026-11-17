@@ -4,7 +4,7 @@
 
 ## 设计说明
 
-Bridge 的设计可以概括为三条主线：飞书事件进入后先鉴权、去重和命令分流；普通任务进入串行队列，由 ACP Runtime 驱动 Claude Code 执行；结果先持久化再投递，失败可由 `/result` 取回。跨重启的事实只落在 SQLite，工作区内的任务串行执行，Bridge 本身不承担对话理解或代码规划。
+Bridge 的设计可以概括为三条主线：飞书事件进入后先鉴权、去重和命令分流；普通消息优先回答 ACP 提问或补充当前任务，显式排队任务进入串行队列，由 ACP Runtime 驱动 Claude Code 执行；结果先持久化再投递，失败可由 `/result` 取回。跨重启的事实只落在 SQLite，工作区内的任务串行执行，Bridge 本身不承担对话理解或代码规划。
 
 ### 架构总览
 
@@ -47,7 +47,16 @@ sequenceDiagram
   alt 保留命令或原生能力命令
     B->>C: 路由并校验
     C-->>U: 状态 / 结果 / 偏好响应
-  else 普通任务
+  else 普通文字且有待答问题
+    B->>DB: 消息去重
+    B->>C: 收集并校验当前问题回答
+    C->>R: 完成原 elicitation 请求
+  else 普通文字且任务执行中
+    B->>DB: 消息去重
+    B->>C: 检查本人会话和执行状态
+    C->>R: steering 补充当前轮次
+    C-->>U: 已投递 / 待继续 / 未确认
+  else 空闲输入或显式 queue 任务
     B->>DB: BEGIN IMMEDIATE 写入去重与任务
     alt 工作区空闲
       B->>R: 立即执行
@@ -92,7 +101,7 @@ stateDiagram-v2
 
 ## 运行范围与技术选型
 
-服务通过飞书 WebSocket 接收消息，由外部 Claude ACP 进程执行任务。默认 stream 模式展示短暂 Typing、ACP 活动与正文流式卡片；5 秒无可见反馈时补状态卡。当前仅支持一个飞书应用、一个固定项目、一个服务实例。工作区内的任务串行执行，忙时按接收顺序排队，默认最多 20 个等待项。飞书投递可以与下一项执行重叠。
+服务通过飞书 WebSocket 接收消息，由外部 Claude ACP 进程执行任务。默认 stream 模式展示短暂 Typing、ACP 活动与正文流式卡片；5 秒无可见反馈时补状态卡。当前仅支持一个飞书应用、一个固定项目、一个服务实例。工作区内的任务串行执行，忙时普通文字默认引导，显式 /queue <内容> 按接收顺序排队，默认最多 20 个等待项。飞书投递可以与下一项执行重叠。
 
 Node.js 运行要求见 [package.json](../package.json) 的 `engines.node`。使用 TypeScript、ACP SDK、飞书 SDK、Pino、Zod 和 Node 内置 SQLite。模块由构造函数注入依赖，不引入 @maxtan/nest-core：当前没有 HTTP 管理接口、Web 鉴权或 Redis 等需要该框架承载的入口。
 
@@ -165,13 +174,13 @@ flowchart TD
 
 ### 消息处理
 
-接入规则（私聊/群聊 @、白名单、附件类型）见[消息规则](usage.md#消息规则)。实现上仅接收 sender_type=user 的事件；群聊必须在 mentions 中包含配置机器人的 open_id，移除对应 mention 占位文本后执行；ADMIN_USERS 不自动获得普通消息执行权限。
+接入规则（私聊/群聊 @、白名单、附件类型）见[消息规则](usage.md#消息规则)。实现上仅接收 sender_type=user 的事件；群聊通常需在 mentions 中包含配置机器人的 open_id，移除对应 mention 占位文本后执行；平台已推送的未 @ 回复，只在 parent_id 精确关联本人提问时接收；ADMIN_USERS 不自动获得普通消息执行权限。
 
 原始 content 字符串最多 64,000 个 UTF-16 码元，解析后的 text 最多 16,000 个 UTF-16 码元，长度检查发生在移除 mention 之前。图片和文件事件只先保存资源元数据，鉴权并调度执行后才从飞书下载；流式累计上限为图片 5 MiB、UTF-8 文本 256 KiB，不写入工作区。附件准备最多 30 秒并受任务取消约束。超长、损坏或其他不支持的消息对符合接入规则的白名单用户返回拒绝提示，不截断指令后执行。无效事件、空文本和未获授权消息被忽略。
 
 ### 命令路由
 
-命令的完整列表与用户可见行为以[命令](usage.md#命令)为准，本节只说明调度语义。Bridge 保留命令在普通任务接纳前由 `commands.ts` 统一识别并分流：任务、队列、结果和状态类命令不进入模型；管理查询、`/answer`、`/skip` 和引导不占队列容量，队列满时仍可执行；`/new` 立即检查当前会话，存在未完成任务时拒绝；未识别的 slash 指令仍作为普通任务进入 FIFO 队列。原生能力命令由 `agent-features.ts` 在能力协商后校验和转换，不创建第二套队列。
+命令的完整列表与用户可见行为以[命令](usage.md#命令)为准，本节只说明调度语义。Bridge 保留命令在普通任务接纳前由 `commands.ts` 统一识别并分流：任务、队列、结果和状态类命令不进入模型；管理查询、`/answer`、`/skip` 和引导不占队列容量，队列满时仍可执行；`/new` 立即检查当前会话，存在未完成任务时拒绝；未识别的 slash 指令按普通输入路由；/queue <内容> 提交独立任务，内容不再按管理命令执行。原生能力命令由 `agent-features.ts` 在能力协商后校验和转换，不创建第二套队列。
 
 状态查询的可见范围和无任务时的回复见[命令](usage.md#命令)。最近输出仅统计非空的 agent_message_chunk 文本，不代表工具心跳，不据此推断停滞或完成百分比。
 
@@ -181,20 +190,20 @@ flowchart TD
 
 回复模式由 TASK_REPLY_MODE 控制，默认 stream；三种模式的用户可见行为见[回复方式](usage.md#回复方式)。task-feedback.ts 管理流式合并和 Typing，工具按 ID 合并，等待回答优先于工具状态。stream 在阈值时没有可见反馈则补状态，不推断卡死或完成百分比；兼容 auto 在达到 TASK_BACKGROUND_NOTICE_MS（默认 5 秒，范围 1–60 秒）时通知一次；回执不阻塞模型执行，最终回复等待其有界投递结束；执行结束清除通知计时器，避免迟发“仍在执行”；排队等待不计入该计时。
 
-1. 鉴权后处理控制命令与拒绝输入，独立去重；普通任务进入接纳逻辑。控制命令不会进入队列或模型。
+1. 鉴权后处理控制命令与拒绝输入，独立去重。非显式排队的普通文字优先回答待答问题，否则执行中补充本人当前任务，空闲时进入任务接纳。/queue <内容> 跳过回答与引导，将其内容作为独立任务；单独 /queue 仍是查询。回答和引导仅登记消息去重，不创建任务记录。
 2. 正常任务在 BEGIN IMMEDIATE 事务内同时插入去重记录和 running（空闲）或 queued（繁忙）任务。事务失败整体回滚并提示重新发送。队列满时仅消费消息去重键，明确告知未接纳。队列项的 prompt 仅在内存中保留。
 3. 事务成功后设置全局 active，启动执行时限计时；按回复模式启动后台通知或流式进度计时器。只有 stream 模式添加 Typing，反馈失败仍继续执行。
-4. 每个任务都重新创建 Adapter 进程；创建前等待上一进程清理。initialize 协议版本必须匹配 SDK 的 PROTOCOL_VERSION。
-5. 若有会话映射且 Agent 声明支持 loadSession，则尝试恢复；恢复失败改建新会话。新旧会话 ID 不同时在结果卡片附注说明，不能仅凭数据库映射宣称上下文已恢复。
-6. 建立权限模式后保存会话 ID，再发送一次 prompt；发送结果失败不会重放 prompt。
-7. 仅 stopReason 为 end_turn 时标记 completed；取消响应标记 cancelled，达到执行或输出限制、模型拒绝、未知结束原因及执行异常标记 failed。非正常结束响应保留部分输出并附原因，随结果持久化，供 /result 取回。取消和失败路径等待运行进程清理。清理失败时停止接受新消息，并保留运行进程句柄以便再次清理。
-8. 执行结束后，取消或失败路径先清理 Adapter；随后在同一事务中保存终态与最终文本，刷新会话时间并释放工作区。同步将队首 queued 改为 running 并设置 active，保持 FIFO。入队回执与执行并行，最终回复等待本任务的回执及在途进度消息。不同任务的飞书回复可并行投递。队列启动落库或进程清理失败时停止调度并中断剩余队列。Bridge 通知入口停止服务并以非零状态退出，由部署环境重启实例。
+4. 每项任务建立运行时并 initialize；同一任务内的连续 prompt 使用同一连接。协议版本保持 ACP v1，跨任务通过持久化 session ID 恢复上下文。
+5. 有会话映射时优先协商 session/resume，其次 loadSession；不能恢复则抛出 SessionRestoreError，保留映射及本条未执行文字，不调用 session/new 静默替换上下文。
+6. 建立权限模式后保存会话 ID，再发送 prompt。当前任务的补充缓冲最多 20 条，按顺序处理；已确认未注入的 promptRequired 输入及原生命令在同一会话进入后续 prompt，继续占有当前工作区锁且不重置总时限。未知投递结果不重发。
+7. 仅 stopReason 为 end_turn 时标记 completed；取消响应标记 cancelled，达到执行或输出限制、模型拒绝、未知结束原因及执行异常标记 failed。非正常结束响应保留部分输出并附原因，随结果持久化，供 /result 取回。所有终态均等待运行进程清理。清理失败时停止接受新消息，并保留运行进程句柄以便再次清理。
+8. 执行结束后，先清理 Adapter；随后在同一事务中保存终态与最终文本，刷新会话时间并释放工作区。同步将队首 queued 改为 running 并设置 active，保持 FIFO。入队回执与执行并行，最终回复等待本任务的回执及在途进度消息。不同任务的飞书回复可并行投递。队列启动落库或进程清理失败时停止调度并中断剩余队列。Bridge 通知入口停止服务并以非零状态退出，由部署环境重启实例。
 
-成功任务的 Adapter 暂时保持驻留，下一任务 open 时重建进程，或在停机及全局闲置满 SESSION_IDLE_TIMEOUT_MS（默认 4 小时）时清理。执行中和队列非空时不执行空闲进程回收；新任务等待已开始的空闲清理完成再 open，防止新进程被旧清理终止。子进程 stdout 用于 ACP，stderr 被消费但不写入业务日志。初始化、新建、恢复、设置模式的单次请求上限各为 30 秒；prompt 由整体任务超时控制。
+所有任务结束时先关闭 Adapter 再交接工作区。ACP v1 的 prompt 结束不能证明后台活动已停止，暂缓跨任务热复用，避免迟到事件混入下一项和执行逃逸任务时限。若协商支持 session/close，先有界请求关闭再终止进程；遗留后台命令可能随之终止。全局闲置满 SESSION_IDLE_TIMEOUT_MS 的清理保留为兜底，新任务等待已开始的闲置清理完成。stdout 用于 ACP，stderr 消费但不写业务日志。普通启动协议请求上限三十秒，prompt 受任务总时限控制。
 
-会话映射保存 last_used_at，在建立会话及释放工作区前更新。执行入口仅恢复尚未闲置满 SESSION_IDLE_TIMEOUT_MS 的映射，过期则创建新会话；运行中的长任务不因该期限被打断。查询、回执及排队接纳不刷新时间，排队任务在实际执行时判断过期。全局闲置回收也清除过期映射，但不删除任务结果或 Claude 历史。管理命令在普通任务接纳前分流，队列满时仍可执行；/new 在当前会话有执行中或排队任务时拒绝重置。
+会话映射保存 last_used_at，但不再按闲置时长删除；四小时仅为空闲资源清理兜底。/new 显式删除映射，/resume 选择本人历史，旧版无活动时间映射仍需显式恢复。查询和回执不刷新资源闲置计时。管理命令在任务接纳前处理，队列满仍可使用；本人有未完成任务时不能 /new。
 
-TASK_TIMEOUT_MS 默认 7,200,000 毫秒（2 小时），最大 86,400,000 毫秒（24 小时），覆盖会话初始化及 prompt 执行；文字输出不会重置该截止时间，无文字输出也没有单独的空闲取消计时器。执行结束后清除执行计时器，结果投递及清理使用各自的有界等待。关闭飞书客户端不改变任务执行；服务重启、Adapter 退出和模型网关错误仍会中断任务。本实现支持长时间执行的单轮任务，提供进程内有界 FIFO 队列，排队时间不计入执行时限；不提供跨重启恢复调度或脱离 prompt 生命周期的命令完成通知。
+TASK_TIMEOUT_MS 默认两小时、最大二十四小时，覆盖初始化、当前任务及其补充引起的后续 prompt。正文、补充和用户回答均不延长时限；没有独立的文字静默取消计时器。独立任务 FIFO 排队时间不计入执行时限。服务重启不自动重放队列或补充，不提供脱离 prompt 的后台命令完成调度。
 
 内存阶段使用 TaskPhase：starting（准备）、executing（执行）、cancelling（取消）、delivering（结果发送与清理）；它们独立于 SQLite 中的任务终态。TaskState、DeliveryState、ChatCommand、StopReason 和 TaskLimits 在 task.ts 中集中定义为 as const 对象及派生联合类型；runtime 的免审批模式 ID、飞书回复消息类型、卡片正文元素 id 和投递错误类别同样以模块级常量收敛。不使用 enum 关键字，兼容 Node 直接运行 TypeScript 和 tsconfig 的 erasableSyntaxOnly。数据库中保存的即为这些字符串值。源码注释解释事务、去重、超时和进程清理约束；协议方法名、Zod 字面量和一次性局部字符串保持原样，不追求全部枚举化。
 
@@ -205,7 +214,7 @@ SQLite 开启 WAL，busy_timeout 为 5 秒。使用 CREATE TABLE IF NOT EXISTS �
 | 表 | 保存内容与语义 |
 |---|---|
 | messages | 去重键和接收时间；不保存消息正文 |
-| sessions | 会话键到 ACP session ID 的映射及 last_used_at 闲置时间 |
+| sessions | 会话键到 ACP session ID 的映射及 last_used_at 活动时间；闲置不删除绑定 |
 | session_history | Bridge 创建或恢复过的会话 ID、所属会话键和最近使用时间；只在所属用户/聊天/话题内列出 |
 | session_preferences | 会话键对应的 model、effort、mode 偏好，运行时验证支持后生效 |
 | tasks | 任务 ID、会话键、消息去重键、状态和时间；新建进入 running 或 queued |
@@ -215,15 +224,15 @@ tasks 使用 queued/running/completed/failed/cancelled/interrupted。启动在�
 
 /result 按会话键和结果写入顺序查询最近已保存结果，可能是当前运行任务之前的结果；取消较晚提交的排队任务不会遮住随后完成的当前任务答案。带任务编号时按同一会话键精确查找；failed 按写入顺序查找投递失败的结果。每次完整结果投递结束后 attempts 加一，含用户重取。任一次投递成功即保留 sent 状态。回复正文与任务终态同事务保存（会话恢复附注仅用于本次任务投递）；若数据库不可写，则记录错误并尽力发送，不能保证结果持久化。
 
-SQLite 不保存完整模型历史；Adapter 会话目录需另外持久化。每次启动在标记中断之后按 DATA_RETENTION_MS（默认 30 天，范围 1 天至 365 天）在同一事务内删除超过保留期的 messages、tasks、results（含任务行已不存在的孤儿结果）和 session_history 行。tasks/results 以任务最后一次状态变更时间为准，保留任务关联的消息去重键也继续保留。清理不会删除 session_preferences 和会话映射，后者按闲置期限回收。去重键清理后，同一事件如再次送达可被重新接纳。`/result` 可取回仍保存在数据库中的结果。
+SQLite 不保存完整模型历史；Adapter 历史目录需另行持久化。启动标记中断后按 DATA_RETENTION_MS（默认三十天）清理 messages、tasks、results 和 session_history；tasks/results 按最后状态变更计时，保留任务的去重键一并保留。清理不删除 session_preferences 或当前会话映射；/new 显式解除映射。去重键清理后再次送达的旧事件可能重新接纳。
 
 ## 权限约束
 
-new/load 均传入 _meta.claudeCode.options.allowDangerouslySkipPermissions=true。默认返回会话必须声明支持 bypassPermissions，并成功响应 session/set_mode(bypassPermissions)，之后才允许 prompt。用户显式 /mode plan 时要求支持并确认 plan 模式，不退回执行模式。缺少模式、设置失败或运行时切换到非请求模式时终止任务，不退回逐条手动审批。模型及 effort 按原生配置选项验证。settings 同时设置 includeCoAuthoredBy=false、attribution.commit/pr 为空及 sessionUrl=false，不修改 Git 作者。
+new/resume/load 均传入 _meta.claudeCode.options.allowDangerouslySkipPermissions=true。默认返回会话必须声明支持 bypassPermissions，并成功响应 session/set_mode(bypassPermissions)，之后才允许 prompt。用户显式 /mode plan 时要求支持并确认 plan 模式，不退回执行模式。缺少模式、设置失败或运行时切换到非请求模式时终止任务，不退回逐条手动审批。模型及 effort 按原生配置选项验证。settings 同时设置 includeCoAuthoredBy=false、attribution.commit/pr 为空及 sessionUrl=false，不修改 Git 作者。
 
 此部署采用 Claude Code 免审批执行：白名单用户启动的任务可直接在容器用户权限下读写文件和执行命令。Bridge 不逐条代点允许；意外收到 session/request_permission 时直接 cancelled，不发送卡片或等待审批。Bridge 不提供客户端文件/终端 ACP 能力，读写和命令由 Agent 自身工具执行。cwd 不是沙箱，所有用户必须获授权访问容器可读写的资源。
 
-普通信息问题通过独立 elicitation/create 处理，不能作为工具授权。每个问题绑定任务会话和请求编号，/answer、/skip 不进入任务队列；任务结束和取消会释放等待。完整模块边界、命令及能力限制见 [Claude 原生能力](claude-capabilities.md)。
+普通信息问题通过 elicitation/create 处理，不作为工具授权。每个请求绑定用户会话和请求编号；平台父消息 ID 与提问、草稿、核对摘要关联，多个请求可精确回复；已识别的过期回复拒绝执行。群聊未 @ 消息仅在平台已推送且明确关联本人问题时接受。表单支持字段校验、选项加备注、多项修改、部分跳过和核对提交；完整 JSON 可直接提交。请求超时、取消或任务结束释放等待。
 
 ## 取消与进程清理
 
@@ -275,7 +284,7 @@ CardKit 创建或正文更新失败，或卡片引用发送被 API 明确永久�
 | TASK_TIMEOUT_MS | 默认 7,200,000（2 小时）；范围 1,000–86,400,000；Compose 显式映射，可通过部署环境覆盖 |
 | TASK_REPLY_MODE | 默认 stream：短暂 Typing、ACP 活动与正文流式卡片；auto 兼容短任务直接返回、长任务通知一次；background 始终先回执 |
 | TASK_BACKGROUND_NOTICE_MS | stream 可见反馈兜底和终态提醒阈值 / auto 通知延迟，默认 5000；可设 10000，范围 1000–60000；从实际执行开始计时，Compose 显式映射 |
-| SESSION_IDLE_TIMEOUT_MS | 默认 14400000（4 小时）；范围 60000–604800000；会话及全局空闲 Adapter 回收期限，Compose 显式映射 |
+| SESSION_IDLE_TIMEOUT_MS | 默认 14400000（4 小时）；范围 60000–604800000；全局空闲资源清理兜底，ACP v1 任务结束即回收进程，保留会话绑定，Compose 显式映射 |
 | CLAUDE_RUNTIME_CONFIG | 可选 JSON 文件路径，支持 mcpServers/maxTurns/maxBudgetUsd；相对工作区解析，Compose 显式映射；不回显凭据 |
 | CANCEL_GRACE_MS | 默认 5,000；范围 100–30,000；两份 Compose 显式透传 |
 | ANTHROPIC_BASE_URL | 选填 HTTP(S) 网关基址。缺失或为空白时交由 Claude 解析路由，非空但格式错误时拒绝启动 |

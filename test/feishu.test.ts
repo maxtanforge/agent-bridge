@@ -12,6 +12,43 @@ const event = (text = 'hello', type = 'text', chat = 'p2p', bot = 'bot') => ({
 });
 const channel = () => new Feishu('app', 'secret', 'bot', pino({ level: 'silent' }));
 
+test('unmentioned group replies retain their parent for Bridge question-owner validation', () => {
+  const raw = event('answer', 'text', 'group', 'another-bot');
+  const reply = normalizeInbound({ ...raw, message: { ...raw.message, parent_id: 'question-message' } }, 'app', 'bot');
+  assert.equal(reply?.replyTo, 'question-message'); assert.equal(reply?.unmentioned, true);
+  assert.equal(normalizeInbound(raw, 'app', 'bot'), undefined);
+});
+
+test('question delivery returns the platform message ID for precise answers', async () => {
+  const f = channel();
+  f.client.im.message.reply = async p => { assert.equal(p.data.msg_type, 'post'); return { code: 0, data: { message_id: 'question-reply' } }; };
+  assert.equal(await f.question(m, 'Choose one', 'question-id'), 'question-reply');
+});
+
+test('long questions retain a replyable anchor after all content chunks', async () => {
+  const f = channel(); const sent: any[] = []; const controller = new AbortController();
+  f.client.im.message.reply = async p => {
+    sent.push(p.data);
+    return { code: 0, data: { message_id: `part-${sent.length}` } };
+  };
+  const reference = await f.question(m, '问题说明'.repeat(3000), 'anchor-delivery-id', controller.signal);
+  assert.ok(sent.length > 2);
+  assert.equal(reference, `part-${sent.length}`);
+  assert.equal(sent.at(-1).uuid, 'anchor-delivery-id');
+  assert.match(sent.at(-1).content, /回复本条消息/);
+  assert.ok(sent.slice(0, -1).every(item => item.uuid !== 'anchor-delivery-id'));
+});
+
+test('aborting long question delivery never sends its reply anchor', async () => {
+  const f = channel(); const controller = new AbortController(); let sends = 0;
+  f.client.im.message.reply = async () => {
+    sends++; controller.abort();
+    return { code: 0, data: { message_id: 'first-chunk' } };
+  };
+  await assert.rejects(f.question(m, '问题说明'.repeat(3000), 'anchor-id', controller.signal));
+  assert.equal(sends, 1);
+});
+
 test('progress and final answer update one shared card in the original thread', async () => {
   const f = channel(); const sent: any[] = []; const patched: any[] = []; const settings: any[] = [];
   f.client.cardkit.v1.card.create = async p => {

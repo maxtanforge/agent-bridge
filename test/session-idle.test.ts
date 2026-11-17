@@ -17,7 +17,7 @@ test('session idle default is four hours', () => {
   assert.equal(baseConfigSchema.parse({ WORKSPACE_ROOT: '.' }).SESSION_IDLE_TIMEOUT_MS, idle);
 });
 
-test('session expiry survives restart and does not delete task results', t => {
+test('session binding survives idle time and restart without deleting task results', t => {
   t.mock.timers.enable({ apis: ['Date'], now: 1700000000000 });
   const path = join(mkdtempSync(join(tmpdir(), 'bridge-idle-')), 'test.db');
   let db = new Store(path);
@@ -25,7 +25,7 @@ test('session expiry survives restart and does not delete task results', t => {
     db.saveSession('key', 'old'); db.accept('task', 'key', 'message'); db.complete('task', 'completed', 'answer');
     db.close(); t.mock.timers.tick(idle - 1); db = new Store(path);
     assert.equal(db.session('key'), 'old');
-    t.mock.timers.tick(1); assert.equal(db.session('key'), undefined);
+    t.mock.timers.tick(1); assert.equal(db.session('key'), 'old');
     assert.equal(db.latestResult('key')!.text, 'answer');
   } finally { db.close(); t.mock.timers.reset(); }
 });
@@ -51,17 +51,18 @@ function fixture() {
   return { db, runtime, bridge, opened, stops: () => stops };
 }
 
-test('idle process is reclaimed at four hours, status does not refresh reuse, next task starts fresh', async t => {
+test('task resources close immediately and idle fallback preserves the next task context', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: 1700000000000 });
   const f = fixture();
   try {
     await f.bridge.handle(message);
-    t.mock.timers.tick(idle - 1); await nextTurn(); assert.equal(f.stops(), 0);
+    assert.equal(f.stops(), 1);
+    t.mock.timers.tick(idle - 1); await nextTurn(); assert.equal(f.stops(), 1);
     await f.bridge.handle({ ...message, id: 'status', text: '/status' });
-    t.mock.timers.tick(1); await nextTurn(); assert.equal(f.stops(), 1);
-    assert.equal(f.db.session(f.bridge.key(message)), undefined);
+    t.mock.timers.tick(1); await nextTurn(); assert.equal(f.stops(), 2);
+    assert.equal(f.db.session(f.bridge.key(message)), 's-1');
     await f.bridge.handle({ ...message, id: '2' });
-    assert.deepEqual(f.opened, [undefined, undefined]);
+    assert.deepEqual(f.opened, [undefined, 's-1']);
   } finally { await f.bridge.stop(); f.db.close(); t.mock.timers.reset(); }
 });
 
@@ -73,7 +74,7 @@ test('continuous work reuses the session and idle timing starts after long execu
     t.mock.timers.tick(idle - 1); await nextTurn();
     f.runtime.prompt = async () => { await new Promise<void>(resolve => { finish = resolve; }); return 'end_turn'; };
     const run = f.bridge.handle({ ...message, id: 'long' }); await nextTurn();
-    t.mock.timers.tick(idle + 1); await nextTurn(); assert.equal(f.stops(), 0);
+    t.mock.timers.tick(idle + 1); await nextTurn(); assert.equal(f.stops(), 1);
     finish(); await run;
     f.runtime.prompt = async () => 'end_turn';
     await f.bridge.handle({ ...message, id: 'after-long' });
@@ -86,7 +87,8 @@ test('new work waits for in-flight idle cleanup before starting runtime', async 
   const f = fixture(); let release!: () => void;
   try {
     await f.bridge.handle(message);
-    f.runtime.stop = async () => { await new Promise<void>(resolve => { release = resolve; }); };
+    const cleanup = new Promise<void>(resolve => { release = resolve; });
+    f.runtime.stop = async () => { await cleanup; };
     t.mock.timers.tick(idle); await nextTurn();
     const next = f.bridge.handle({ ...message, id: '2' }); await nextTurn();
     assert.equal(f.opened.length, 1);
@@ -102,12 +104,12 @@ test('cancelling the last queued task during its acknowledgement still schedules
   f.bridge.channel.send = async (_m, text) => { if (text.includes('已加入队列')) await ack; };
   try {
     const first = f.bridge.handle(message); await nextTurn();
-    const queued = f.bridge.handle({ ...message, id: 'queued' });
+    const queued = f.bridge.handle({ ...message, id: 'queued', text: '/queue work' });
     const cancel = f.bridge.handle({ ...message, id: 'clear', text: '/cancel all' });
     finish(); await first;
     assert.equal(f.bridge.active, undefined);
     releaseAck(); await Promise.all([queued, cancel]);
     t.mock.timers.tick(idle); await nextTurn();
-    assert.equal(f.stops(), 1); assert.equal(f.opened.length, 1);
+    assert.equal(f.stops(), 2); assert.equal(f.opened.length, 1);
   } finally { finish?.(); releaseAck(); await f.bridge.stop(); f.db.close(); t.mock.timers.reset(); }
 });

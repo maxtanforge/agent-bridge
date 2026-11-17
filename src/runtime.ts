@@ -10,6 +10,15 @@ import { version } from './version.ts';
 /** 免审批模式 ID：会话必须声明支持且 set_mode 确认后才允许 prompt。 */
 const BypassMode = 'bypassPermissions';
 
+export class SessionRestoreError extends Error {
+  readonly sessionId: string;
+  constructor(sessionId: string, cause?: unknown) {
+    super(`Unable to restore session ${sessionId}; retry or explicitly start a new session`, { cause });
+    this.sessionId = sessionId;
+    this.name = 'SessionRestoreError';
+  }
+}
+
 export class AcpRuntime implements Runtime {
   cwd: string; entry: string; process?: ChildProcessWithoutNullStreams; connection?: ClientConnection;
   private stopping?: Promise<void>;
@@ -18,13 +27,18 @@ export class AcpRuntime implements Runtime {
   private image = false;
   private lifetime = new AbortController();
   private options: RuntimeOptions;
+  private closeSession?: string;
+  private closeSupported = false;
+  private prompting = false;
   constructor(cwd: string, entry?: string, options: RuntimeOptions = {}) {
     this.options = options;
     this.cwd = cwd;
     this.entry = entry ?? join(dirname(createRequire(import.meta.url).resolve('@agentclientprotocol/claude-agent-acp/package.json')), 'dist/index.js');
   }
   async open(old: string | undefined, update: Parameters<Runtime['open']>[1], permission: Parameters<Runtime['open']>[2], signal?: AbortSignal, hooks: RuntimeHooks = {}) {
-    // 每轮重新创建 Adapter；历史上下文通过 session/load 恢复，而不是复用旧连接。
+    signal?.throwIfAborted();
+    // ACP v1 prompt completion does not establish background quiescence. Give
+    // each task its own process so late events cannot reach the next task.
     await this.stop();
     signal?.throwIfAborted();
     // 环境变量白名单：只传 Adapter 运行所需变量；飞书密钥、NPM_TOKEN 等不会进入模型子进程。
@@ -53,6 +67,7 @@ export class AcpRuntime implements Runtime {
     let modeUpdate: string | undefined;
     let config: import('@agentclientprotocol/sdk').SessionConfigOption[] = [];
     const notification = ({ sessionId, update: u }: SessionNotification) => {
+      if (this.connection !== connection) return;
       if (!activeSession) {
         // History is never forwarded; retain only latest setup metadata per session.
         if (['config_option_update', 'available_commands_update', 'current_mode_update', 'session_info_update'].includes(u.sessionUpdate)) {
@@ -75,15 +90,15 @@ export class AcpRuntime implements Runtime {
         }
       }
       if (u.sessionUpdate === 'config_option_update') { config = u.configOptions; hooks.onEvent?.({ type: 'config', options: config }); }
-      if (['available_commands_update', 'session_info_update'].includes(u.sessionUpdate) || (live && ['tool_call', 'tool_call_update', 'plan', 'usage_update'].includes(u.sessionUpdate))) {
+      if (['available_commands_update', 'session_info_update'].includes(u.sessionUpdate) || (live && this.prompting && ['tool_call', 'tool_call_update', 'plan', 'usage_update'].includes(u.sessionUpdate))) {
         hooks.onEvent?.({ type: 'update', update: u });
       }
-      if (live && u.sessionUpdate === 'agent_message_chunk' && u.content.type === 'text') update(u.content.text);
+      if (live && this.prompting && u.sessionUpdate === 'agent_message_chunk' && u.content.type === 'text') update(u.content.text);
     };
-    const connection = client()
+    const connection: ClientConnection = client()
       .onNotification('session/update', ({ params }) => notification(params))
       .onRequest('elicitation/create', async ({ params, signal: requestSignal }) => {
-        if (!hooks.onQuestion || !live || !CreateElicitationRequest.isForm(params) || !('sessionId' in params) || params.sessionId !== activeSession) return { action: 'cancel' as const };
+        if (this.connection !== connection || !hooks.onQuestion || !live || !this.prompting || !CreateElicitationRequest.isForm(params) || !('sessionId' in params) || params.sessionId !== activeSession) return { action: 'cancel' as const };
         const combined = AbortSignal.any([requestSignal, this.lifetime.signal]);
         if (combined.aborted) return { action: 'cancel' as const };
         const answer = await new Promise<import('./types.ts').QuestionAnswer>((resolve, reject) => {
@@ -94,9 +109,14 @@ export class AcpRuntime implements Runtime {
         });
         return answer.action === 'accept' ? { action: 'accept' as const, content: answer.content } : { action: answer.action };
       })
-      .onRequest('session/request_permission', ({ params }) => params.sessionId === activeSession ? permission(params as Parameters<Parameters<Runtime['open']>[2]>[0]) : { outcome: { outcome: 'cancelled' as const } })
+      .onRequest('session/request_permission', ({ params }) => this.connection === connection && live && this.prompting && !this.lifetime.signal.aborted && params.sessionId === activeSession ? permission(params as Parameters<Parameters<Runtime['open']>[2]>[0]) : { outcome: { outcome: 'cancelled' as const } })
       .connect(ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout)));
     this.connection = connection;
+    connection.signal.addEventListener('abort', () => {
+      if (this.connection !== connection) return;
+      this.readySession = undefined;
+      this.lifetime.abort();
+    }, { once: true });
     child.on('error', error => connection.close(error));
     child.on('exit', () => connection.close(new Error('ACP process exited')));
     // Closing the connection interrupts startup requests. The catch below awaits
@@ -123,15 +143,19 @@ export class AcpRuntime implements Runtime {
       if (init.protocolVersion !== PROTOCOL_VERSION) throw new Error('Unsupported ACP version');
       this.steering = (init._meta?.steering as { supported?: unknown } | undefined)?.supported === true;
       this.image = init.agentCapabilities?.promptCapabilities?.image === true;
+      this.closeSupported = !!init.agentCapabilities?.sessionCapabilities?.close;
       hooks.onEvent?.({ type: 'capabilities', steering: this.steering, image: init.agentCapabilities?.promptCapabilities?.image === true });
-      let session: Awaited<ReturnType<typeof load>> | undefined;
-      const load = async () => ({ ...await connection.agent.request('session/load', { sessionId: old!, ...sessionParams }, opts()), sessionId: old! });
-      if (old && init.agentCapabilities?.loadSession) {
-        try { session = await load(); }
-        catch { signal?.throwIfAborted(); /* New-session fallback is surfaced by Bridge. */ }
-      }
-      const selected = session ?? await connection.agent.request('session/new', sessionParams, opts());
+      const restore = async () => {
+        try {
+          const params = { sessionId: old!, ...sessionParams };
+          if (init.agentCapabilities?.sessionCapabilities?.resume) return { ...await connection.agent.request<import('@agentclientprotocol/sdk/unstable').ResumeSessionResponse>('session/resume', params, opts()), sessionId: old! };
+          if (init.agentCapabilities?.loadSession) return { ...await connection.agent.request<import('@agentclientprotocol/sdk/unstable').LoadSessionResponse>('session/load', params, opts()), sessionId: old! };
+          throw new Error('Session restoration unavailable');
+        } catch (error) { signal?.throwIfAborted(); throw new SessionRestoreError(old!, error); }
+      };
+      const selected = old ? await restore() : await connection.agent.request<import('@agentclientprotocol/sdk/unstable').NewSessionResponse>('session/new', sessionParams, opts());
       if (!selected) throw new Error('Missing session');
+      this.closeSession = selected.sessionId;
       config = selected.configOptions ?? [];
       hooks.onEvent?.({ type: 'config', options: config });
       activeSession = selected.sessionId;
@@ -147,7 +171,7 @@ export class AcpRuntime implements Runtime {
         if (value === undefined) continue;
         const option = config.find(o => o.category === category || o.id === (category === 'model' ? 'model' : 'effort'));
         if (!option || option.type !== 'select' || !option.options.flatMap(o => 'options' in o ? o.options : [o]).some(o => o.value === value)) throw new Error(`${category} preference unavailable`);
-        const result = await connection.agent.request('session/set_config_option', { sessionId: selected.sessionId, configId: option.id, value }, opts());
+        const result = await connection.agent.request<import('@agentclientprotocol/sdk/unstable').SetSessionConfigOptionResponse>('session/set_config_option', { sessionId: selected.sessionId, configId: option.id, value }, opts());
         config = result.configOptions;
         if (!config.some(o => o.id === option.id && o.currentValue === value)) throw new Error(`${category} preference not confirmed`);
         hooks.onEvent?.({ type: 'config', options: config });
@@ -169,13 +193,17 @@ export class AcpRuntime implements Runtime {
     if (attachments.some(a => a.type === 'image') && !this.image) throw new Error('Native image input unavailable');
     // 等待整轮执行结束；不因暂时没有 agent_message_chunk 就中断工具工作。
     const prompt: import('@agentclientprotocol/sdk/unstable').ContentBlock[] = [{ type: 'text', text }, ...attachments];
-    return (await this.connection.agent.request('session/prompt', { sessionId, prompt })).stopReason;
+    const connection = this.connection;
+    this.prompting = true;
+    try { return (await connection.agent.request('session/prompt', { sessionId, prompt })).stopReason; }
+    finally { if (this.connection === connection) this.prompting = false; }
   }
-  async steer(sessionId: string, text: string): Promise<'injected' | 'promptRequired'> {
+  async steer(sessionId: string, text: string, attachments: PromptAttachment[] = []): Promise<'injected' | 'promptRequired'> {
     if (!this.connection || this.readySession !== sessionId) throw new Error('Runtime not ready');
     if (!this.steering) throw new Error('Native steering unavailable');
+    if (attachments.some(a => a.type === 'image') && !this.image) throw new Error('Native image input unavailable');
     const result = await this.connection.agent.request('_session/steering', {
-      sessionId, prompt: [{ type: 'text', text }], _meta: { steering: { idleBehavior: 'promptRequired' } },
+      sessionId, prompt: [{ type: 'text', text }, ...attachments], _meta: { steering: { idleBehavior: 'promptRequired' } },
     }, { cancellationSignal: AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(30000)]), stopWaitingOnCancel: true });
     if (!result || typeof result !== 'object' || !('outcome' in result)) throw new Error('Invalid steering outcome');
     if (result.outcome !== 'injected' && result.outcome !== 'promptRequired') throw new Error('Invalid steering outcome');
@@ -183,6 +211,7 @@ export class AcpRuntime implements Runtime {
   }
   async cancel(sessionId: string) {
     if (sessionId !== this.readySession) return;
+    this.readySession = undefined;
     this.lifetime.abort();
     await this.connection?.agent.notify('session/cancel', { sessionId });
   }
@@ -194,9 +223,17 @@ export class AcpRuntime implements Runtime {
     this.image = false;
     const child = this.process;
     const connection = this.connection;
+    const closeSession = this.closeSupported ? this.closeSession : undefined;
+    this.closeSession = undefined; this.closeSupported = false;
+    this.prompting = false;
     this.connection = undefined; this.readySession = undefined;
     if (!child && !connection) return Promise.resolve();
     const cleanup = Promise.resolve().then(async () => {
+      if (connection && closeSession && !connection.signal.aborted) {
+        try {
+          await connection.agent.request('session/close', { sessionId: closeSession }, { cancellationSignal: AbortSignal.timeout(1000), stopWaitingOnCancel: true });
+        } catch { /* Closing is best effort; process termination remains mandatory. */ }
+      }
       try { connection?.close(); }
       finally { if (child) await this.terminate(child); }
       if (this.process === child) this.process = undefined;

@@ -33,7 +33,7 @@ for (const [reason, expected, explanation] of cases) {
         const stored = db.latestResult(bridge.key(message))!;
         assert.equal(db.taskStatus(stored.task), expected);
         assert.equal(replies[0].state, expected); assert.equal(replies[0].text, stored.text);
-        assert.equal(stops, expected === 'completed' ? 0 : 1);
+        assert.equal(stops, 1);
         if (output) assert.ok(stored.text.includes(output));
         if (explanation) assert.match(stored.text, explanation);
         if (expected === 'failed' && output) assert.match(stored.text, /部分输出/);
@@ -60,7 +60,7 @@ test('limited task finishes process cleanup before the next queued task starts',
   const bridge = new Bridge(db, runtime, { async send() {} }, { users: ['u'], admins: [], workspace: 'w', taskTimeout: 10000, cancelGrace: 10 });
   try {
     const first = bridge.handle(message); await nextTurn();
-    await bridge.handle({ ...message, id: 'second', text: 'next' });
+    await bridge.handle({ ...message, id: 'second', text: '/queue next' });
     finish(); await nextTurn(); assert.deepEqual(prompts, ['work']);
     releaseCleanup(); await first; await nextTurn(); assert.deepEqual(prompts, ['work', 'next']);
     await bridge.active?.done;
