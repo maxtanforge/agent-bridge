@@ -247,7 +247,7 @@ CardKit 创建或正文更新失败，或卡片引用发送被 API 明确永久�
 
 默认 stream 模式在原消息上添加一次 Typing，与模型启动并行，卡片或降级回执送达后移除，结束/失败/取消时兜底清理，迟到添加也清理，不循环重加；添加和移除分别最多等待 3 秒，失败只记录脱敏日志。需要 im:message.reactions:write_only，CardKit 另需 cardkit:card:write；已有应用由管理员补充并发布，新扫码申请这两项。进程异常退出或远端清理失败可能遗留表情或流式状态。
 
-最终投递遇到可恢复网络错误/限流最多尝试 3 次，卡片与富文本共用 15 秒窗口；进度投递窗口最多 3 秒，不做应用层重试，下一快照可继续未完成的卡片引用发送。CardKit 创建/正文更新异常优先降级，关闭异常不将已接受的结果标为未送达。每个 HTTP 请求上限 10 秒，由独立 HTTP 实例通过 AsyncLocalStorage 接收当前 AbortSignal；过期窗口不继续发送余下分片。重试不重放 Agent prompt。交互路径参考 OpenClaw 的 [streaming-card.ts](https://github.com/openclaw/openclaw/blob/main/extensions/feishu/src/streaming-card.ts) 和 [reply-dispatcher.ts](https://github.com/openclaw/openclaw/blob/main/extensions/feishu/src/reply-dispatcher.ts)，不表示已实现其所有渠道能力。
+最终投递遇到可恢复网络错误/限流最多尝试 3 次，卡片与富文本共用 15 秒窗口；进度单次投递窗口最多 3 秒；失败后按 1、2、4 秒退避，最多自动重试 3 次，期间合并最新快照，任务结束时取消待重试计时器；预算耗尽后新的活动或正文可再次触发投递，下一快照可继续未完成的卡片引用发送。CardKit 创建/正文更新异常优先降级，关闭异常不将已接受的结果标为未送达。每个 HTTP 请求上限 10 秒，由独立 HTTP 实例通过 AsyncLocalStorage 接收当前 AbortSignal；过期窗口不继续发送余下分片。重试不重放 Agent prompt。交互路径参考 OpenClaw 的 [streaming-card.ts](https://github.com/openclaw/openclaw/blob/main/extensions/feishu/src/streaming-card.ts) 和 [reply-dispatcher.ts](https://github.com/openclaw/openclaw/blob/main/extensions/feishu/src/reply-dispatcher.ts)，不表示已实现其所有渠道能力。
 
 扫码时优先输出授权链接。日志二维码使用 L 纠错级别降低密度，每个模块占两个字符宽、一行高，不使用半格字符。每行独立设置 ANSI 黑色前景/亮白背景，深色模块同时设置黑背景并输出实心块，浅色模块输出两个空格；颜色变化处切换背景，行尾重置。四模块留白明确为白色，不依赖深色主题。剥离 ANSI 后仍保留字符图案，但不能保证主题对比度；查看器行距、字体和自动换行也可能破坏扫描，因此不声称日志图案适用于所有 Portainer 版本。
 
@@ -267,7 +267,7 @@ CardKit 创建或正文更新失败，或卡片引用发送被 API 明确永久�
 | FEISHU_APP_NAME | 首次扫码创建的预设名称，默认 AgentBridge；去除首尾空白，空值使用默认值；Compose 显式映射，不修改已有应用 |
 | FEISHU_SELECT_EXISTING_APP | 仅接受 true/false，默认 false；true 时首次扫码确认页可选择已有应用并增量授权；Compose 显式映射 |
 | ALLOWED_USERS | 逗号分隔 open_id；自动模式默认扫码者，手动模式必须至少一个；Compose 显式映射 |
-| ADMIN_USERS | 默认空列表 |
+| ADMIN_USERS | 默认空列表，两份 Compose 显式透传；管理员也需在 ALLOWED_USERS 中 |
 | WORKSPACE_ROOT | 本地 Node 必填，取消 .env.example 中的注释并设置已存在的绝对目录；相对路径由 Bridge 进程 cwd 解析。Compose 固定注入 /data/workspace，不读取 .env 的同名值，也不据此挂载宿主机目录 |
 | WORKSPACE_PROJECT | 默认 .，解析后的目录必须存在且位于 WORKSPACE_ROOT 内；Compose 从部署环境读取，用于选择 /data/workspace 内的项目 |
 | DATABASE_PATH | 默认 data/agentbridge.db |
@@ -277,7 +277,7 @@ CardKit 创建或正文更新失败，或卡片引用发送被 API 明确永久�
 | TASK_BACKGROUND_NOTICE_MS | stream 可见反馈兜底和终态提醒阈值 / auto 通知延迟，默认 5000；可设 10000，范围 1000–60000；从实际执行开始计时，Compose 显式映射 |
 | SESSION_IDLE_TIMEOUT_MS | 默认 14400000（4 小时）；范围 60000–604800000；会话及全局空闲 Adapter 回收期限，Compose 显式映射 |
 | CLAUDE_RUNTIME_CONFIG | 可选 JSON 文件路径，支持 mcpServers/maxTurns/maxBudgetUsd；相对工作区解析，Compose 显式映射；不回显凭据 |
-| CANCEL_GRACE_MS | 默认 5,000；范围 100–30,000 |
+| CANCEL_GRACE_MS | 默认 5,000；范围 100–30,000；两份 Compose 显式透传 |
 | ANTHROPIC_BASE_URL | 选填 HTTP(S) 网关基址。缺失或为空白时交由 Claude 解析路由，非空但格式错误时拒绝启动 |
 | ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY | Bridge 不校验是否设置；按网关选择 Bearer 或 x-api-key 凭证 |
 | ANTHROPIC_MODEL | Bridge 不校验是否设置；部署时填写网关可用的主模型 ID |

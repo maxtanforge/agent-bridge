@@ -3,6 +3,19 @@ import assert from 'node:assert/strict';
 import { AgentState } from '../src/agent-state.ts';
 import { resolve } from 'node:path';
 
+test('completed history cannot evict active tools or hide them in queries', () => {
+  const state = new AgentState(resolve('project'));
+  const update = (toolCallId: string, status: string) => state.apply({ type: 'update', update: {
+    sessionUpdate: 'tool_call_update', toolCallId, status, title: toolCallId } });
+  state.apply({ type: 'update', update: { sessionUpdate: 'tool_call', toolCallId: 'long-test', title: 'long-test',
+    status: 'in_progress', content: [{ type: 'diff', path: 'result.ts' }] } });
+  for (let i = 0; i < 100; i++) update(`read-${i}`, 'completed');
+  assert.match(state.activityText(), /long-test/); assert.match(state.toolsText(), /long-test/);
+  assert.ok(state.tools.size <= 30);
+  state.apply({ type: 'update', update: { sessionUpdate: 'tool_call_update', toolCallId: 'long-test', status: 'completed' } });
+  assert.match(state.changeSummary(), /result.ts/);
+});
+
 test('change summaries require completed tools and distinguish same-named project files', () => {
   const workspace = resolve('project');
   const state = new AgentState(workspace);
