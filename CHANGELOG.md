@@ -4,6 +4,18 @@ Release Please 根据 Conventional Commits 在发布 PR 中维护此文件，版
 
 首个版本为 `package.json` 中的 `0.1.0`，对应 Git 标签 `v0.1.0` 和镜像标签 `0.1.0`。以下为接入版本管理时的能力记录，正式发布条目由 Release Please 在发布 PR 中生成。
 
+## [0.5.0](https://github.com/maxtanforge/agent-bridge/compare/v0.4.0...v0.5.0) (2026-11-17)
+
+
+### Features
+
+* support conversational ACP input and preserve session context ([b216af0](https://github.com/maxtanforge/agent-bridge/commit/b216af0983722701f918ff00f7e095af0e008b25))
+
+
+### Bug Fixes
+
+* retry task feedback and preserve active tool state ([25f2b08](https://github.com/maxtanforge/agent-bridge/commit/25f2b08ecefc310d36c71c4dafebc2356bdf9f3a))
+
 ## [0.4.0](https://github.com/maxtanforge/agent-bridge/compare/v0.3.0...v0.4.0) (2026-11-16)
 
 
