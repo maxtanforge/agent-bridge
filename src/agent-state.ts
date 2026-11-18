@@ -84,12 +84,15 @@ export class AgentState {
     return tools.length ? [...tools.filter(activeTool).reverse(), ...tools.filter(t => !activeTool(t)).reverse()]
       .slice(0, 10).map(t => `${t.title}：${t.status}`).join('\n') : '尚未收到工具执行事件。';
   }
-  brief() { const t = [...this.tools.values()].at(-1); return t ? `最近工具：${t.title}（${t.status}）` : ''; }
-  activityText() {
-    const active = [...this.tools.values()].filter(t => t.status === 'pending' || t.status === 'in_progress');
+  brief() {
+    const latest = [...this.tools.values()].at(-1);
+    return this.activityText(latest ? `最近工具：${latest.title}（${latest.status}）` : '');
+  }
+  activityText(fallback = '正在处理') {
+    const active = [...this.tools.values()].filter(activeTool);
     if (active.length) return `正在执行工具（${active.length} 项）：${active.slice(0, 3).map(t => t.title).join('；')}`;
     const step = this.plan.find(e => e.status === 'in_progress');
-    return step ? `当前计划：${step.content}` : '正在处理';
+    return step ? `当前计划：${step.content}` : fallback;
   }
   planText() { return this.plan.length ? this.plan.map(e => `[${e.status}] ${e.content}`).join('\n') : '尚未收到任务计划事件。'; }
   usageText() { const u = this.usage; return u ? `运行时报告的上下文：${u.used} / ${u.size}${u.amount === undefined ? '' : `\n运行时费用估算：${u.amount} ${u.currency}（以服务商账单为准）`}` : '尚未收到运行时用量数据。'; }
