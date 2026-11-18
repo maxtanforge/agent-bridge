@@ -4,6 +4,13 @@ Release Please 根据 Conventional Commits 在发布 PR 中维护此文件，版
 
 首个版本为 `package.json` 中的 `0.1.0`，对应 Git 标签 `v0.1.0` 和镜像标签 `0.1.0`。以下为接入版本管理时的能力记录，正式发布条目由 Release Please 在发布 PR 中生成。
 
+## [0.5.1](https://github.com/maxtanforge/agent-bridge/compare/v0.5.0...v0.5.1) (2026-11-18)
+
+
+### Bug Fixes
+
+* prevent Feishu streaming replies from repainting ([9903077](https://github.com/maxtanforge/agent-bridge/commit/9903077a87ee8241b0601fbcf088f6785fcc418b))
+
 ## [0.5.0](https://github.com/maxtanforge/agent-bridge/compare/v0.4.0...v0.5.0) (2026-11-17)
 
 
