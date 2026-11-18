@@ -39,8 +39,8 @@ test('unavailable CardKit sends one acknowledgement then final without repeated 
 
 test('long stream completion reminder is deduplicated and activity is removed from final', async () => {
   const { calls, replies } = fixture();
-  await replies.task(message, { id: 't', state: 'running', text: 'draft', activity: '正在测试' });
-  assert.match(String(calls.find(c => c.op === 'update')?.text), /正在测试/);
+  await replies.task(message, { id: 't', state: 'running', text: '', activity: '正在测试' });
+  assert.equal(calls.find(c => c.op === 'update')?.text, '正在测试');
   const final = { id: 't', state: 'completed' as const, text: 'answer', notifyCompletion: true };
   await replies.task(message, final); await replies.task(message, final);
   assert.equal(calls.filter(c => c.op === 'post').length, 1);

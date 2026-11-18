@@ -11,6 +11,7 @@ test('completed history cannot evict active tools or hide them in queries', () =
     status: 'in_progress', content: [{ type: 'diff', path: 'result.ts' }] } });
   for (let i = 0; i < 100; i++) update(`read-${i}`, 'completed');
   assert.match(state.activityText(), /long-test/); assert.match(state.toolsText(), /long-test/);
+  assert.match(state.brief(), /正在执行工具.*long-test/);
   assert.ok(state.tools.size <= 30);
   state.apply({ type: 'update', update: { sessionUpdate: 'tool_call_update', toolCallId: 'long-test', status: 'completed' } });
   assert.match(state.changeSummary(), /result.ts/);
@@ -46,6 +47,7 @@ test('agent state merges partial tool updates and renders actual plan and usage'
   assert.doesNotMatch(JSON.stringify(state), /hidden/);
   state.apply({ type: 'update', update: { sessionUpdate: 'plan', entries: [{ content: 'Verify', status: 'in_progress', priority: 'high' }] } });
   assert.match(state.planText(), /Verify/);
+  assert.match(state.brief(), /当前计划.*Verify/);
   state.apply({ type: 'update', update: { sessionUpdate: 'usage_update', used: 120, size: 1000, cost: { amount: 0.2, currency: 'USD' } } });
   assert.match(state.usageText(), /120.*1000/);
 });

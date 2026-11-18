@@ -7,12 +7,15 @@ import { TaskState, TaskLimits } from './task.ts';
 const id = (...parts: unknown[]) => createHash('sha256').update(JSON.stringify(parts)).digest('hex').slice(0, 32);
 // Do not interpret model-produced text as Feishu mention recipients.
 const markdown = (text: string) => text.replace(/<(?=\/?at\b)/gi, '&lt;');
+// The next chunk can turn a trailing '<at' into a mention or a literal '<atlas>'.
+const incompleteMention = /<\/?(?:at?)?$/i;
 /** 富文本 post 消息体；内部转义 at 标签防止模型文本 @人。 */
 export function richPost(text: string): string {
   return JSON.stringify({ zh_cn: { content: [[{ tag: 'md', text: markdown(text) }]] } });
 }
 /** 卡片正文元素 id；此处定义与 feishu.ts 的内容更新共用，两处必须一致。 */
 export const ContentElementId = 'content';
+const ReplyChunkCodePoints = 3000;
 /** 流式卡片初始 card_json；正文经 cardElement.content 增量写入。 */
 export function streamCard(): string {
   return JSON.stringify({ schema: '2.0', config: { streaming_mode: true,
@@ -30,7 +33,7 @@ export function splitReply(text: string): string[] {
   let offset = 0; let fence: { marker: string; language: string } | undefined;
   while (offset < chars.length) {
     const prefix = fence ? `${fence.marker}${fence.language}\n` : '';
-    let end = Math.min(offset + 3000, chars.length);
+    let end = Math.min(offset + ReplyChunkCodePoints, chars.length);
     if (end < chars.length) {
       const boundary = chars.slice(offset, end).lastIndexOf('\n');
       if (boundary >= 1500) end = offset + boundary + 1;
@@ -84,6 +87,8 @@ type ReplyState = {
   sequence: number;
   /** 平台已确认写入卡片的正文。 */
   accepted: string;
+  /** 已确认的正文预览。仅允许向后追加，直到终态替换。 */
+  preview?: string;
   /** 已降级为富文本，不再尝试任何卡片操作。 */
   fallback: boolean;
   /** 卡片流式状态已关闭。 */
@@ -140,9 +145,16 @@ export class FeishuReplies {
       this.tasks.set(key, state);
     }
     const final = reply.state !== TaskState.Running;
-    const text = [!final && reply.activity, reply.text, reply.note].filter(Boolean).join('\n\n');
-    const chunks = splitReply(text);
-    if (!chunks.length) return;
+    const text = [reply.text, reply.note].filter(Boolean).join('\n\n');
+    const chunks = final ? splitReply(text) : [];
+    // CardKit receives the full snapshot and animates the suffix of the previous one.
+    // Keep volatile status and final Markdown split boundaries out of the live answer.
+    const candidate = !final && reply.text
+      ? Array.from(reply.text).slice(0, ReplyChunkCodePoints).join('').replace(incompleteMention, '')
+      : undefined;
+    const preview = candidate?.startsWith(state.preview ?? '') ? candidate : state.preview;
+    const content = final ? chunks[0] : preview ?? (reply.activity || reply.note);
+    if (!content) return;
     if (!state.fallback && !state.card) {
       try { state.card = await this.transport.create(signal); }
       catch (error) {
@@ -158,17 +170,18 @@ export class FeishuReplies {
         state.fallback = true; this.warn('stream-reply', error);
       }
     }
-    if (!state.fallback && !state.closed && state.card && state.accepted !== chunks[0]) {
+    if (!state.fallback && !state.closed && state.card && state.accepted !== content) {
       const sequence = ++state.sequence;
       try {
-        await this.transport.update(state.card, markdown(chunks[0]), sequence, id(state.card, 'update', sequence), signal);
-        state.accepted = chunks[0];
+        await this.transport.update(state.card, markdown(content), sequence, id(state.card, 'update', sequence), signal);
+        state.accepted = content;
       } catch (error) {
         // 长任务可能遇到远端流式状态过期；仅降级消息渠道，不取消执行中的 Claude。
         signal?.throwIfAborted(); state.fallback = true; this.warn('stream-update', error);
       }
     }
     if (!final) {
+      if (!state.fallback) state.preview = preview;
       if (state.fallback) {
         const notice = `任务正在执行，完成后通知你。\n任务编号：${reply.id}\n/status 查看进度；/cancel ${reply.id} 取消。`;
         await this.posts(m, notice, [notice], 0, signal, state);

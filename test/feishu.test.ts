@@ -73,6 +73,50 @@ test('progress and final answer update one shared card in the original thread', 
   await f.forgetTask(message, 'task'); assert.equal(settings.length, 1);
 });
 
+test('streamed answer grows without rewrites when activity changes or crosses a split boundary', async () => {
+  const f = channel(); const bodyUpdates: string[] = []; const posts: string[] = [];
+  f.client.cardkit.v1.card.create = async () => ({ code: 0, data: { card_id: 'entity' } });
+  f.client.cardkit.v1.card.settings = async () => ({ code: 0 });
+  f.client.im.message.reply = async p => {
+    if (p.data.msg_type === 'post') posts.push(JSON.parse(p.data.content).zh_cn.content[0][0].text);
+    return { code: 0, data: { message_id: 'card' } };
+  };
+  f.client.cardkit.v1.cardElement.content = async p => { if (p.path.element_id === 'content') bodyUpdates.push(p.data.content!); return { code: 0 }; };
+  const reply = (text: string, activity: string) => f.task(m, { id: 'task', state: 'running', text, activity });
+  const first = 'a'.repeat(2000) + '\n' + 'b'.repeat(800);
+  const second = first + 'c'.repeat(100);
+  const last = second + 'd'.repeat(750);
+  await reply('', '正在分析');
+  await reply(first, '正在读取');
+  await reply(first, '正在执行测试');
+  await reply(second, '正在执行测试');
+  await reply(last, '正在整理');
+  const final = '（回复过长）\n\n' + 'z'.repeat(24000);
+  await reply(final, '正在整理');
+  assert.deepEqual(bodyUpdates, ['正在分析', first, second, last.slice(0, 3000)]);
+
+  await f.task(m, { id: 'task', state: 'completed', text: final });
+  assert.equal(bodyUpdates.at(-1)! + posts.join(''), final);
+});
+
+test('partial mention prefixes never rewrite text already sent to CardKit', async () => {
+  const f = channel(); const updates: string[] = [];
+  f.client.cardkit.v1.card.create = async () => ({ code: 0, data: { card_id: 'entity' } });
+  f.client.cardkit.v1.card.settings = async () => ({ code: 0 });
+  f.client.im.message.reply = async () => ({ code: 0, data: { message_id: 'card' } });
+  f.client.cardkit.v1.cardElement.content = async p => { updates.push(p.data.content!); return { code: 0 }; };
+  const escaped = '前缀 <atlas> &lt;at id=all>读取&lt;/at>';
+  for (const text of ['前缀 <', '前缀 <a', '前缀 <at', '前缀 <atlas>', '前缀 <atlas> <at',
+    '前缀 <atlas> <at id=all>读取</', '前缀 <atlas> <at id=all>读取</at>']) {
+    await f.task(m, { id: 'task', state: 'running', text });
+  }
+  assert.deepEqual(updates, ['前缀 ', '前缀 <atlas>', '前缀 <atlas> ', '前缀 <atlas> &lt;at id=all>读取', escaped]);
+  assert.ok(updates.slice(1).every((text, i) => text.startsWith(updates[i])));
+
+  await f.task(m, { id: 'task', state: 'completed', text: '前缀 <atlas> <at id=all>读取</at> 后缀 <a' });
+  assert.equal(updates.at(-1), `${escaped} 后缀 <a`);
+});
+
 test('an uncertain first card send retries the same UUID and initial payload before applying final text', async () => {
   const f = channel(); const sent: any[] = []; const patched: any[] = [];
   f.client.cardkit.v1.card.create = async () => ({ code: 0, data: { card_id: 'entity' } });
