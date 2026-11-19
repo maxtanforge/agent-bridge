@@ -24,7 +24,7 @@ export class AgentFeatures {
       onEvent: event => {
         if (this.current !== run || run.abort.signal.aborted) return;
         state.apply(event);
-        if (event.type === 'update' && ['tool_call', 'tool_call_update', 'plan'].includes(String(event.update.sessionUpdate))) {
+        if (event.type === 'background' || (event.type === 'update' && ['tool_call', 'tool_call_update', 'plan'].includes(String(event.update.sessionUpdate)))) {
           onActivity?.(this.interactions.count(key) ? '等待你回答，直接回复即可；/questions 查看。' : state.activityText());
         }
       },

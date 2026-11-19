@@ -73,6 +73,25 @@ test('progress and final answer update one shared card in the original thread', 
   await f.forgetTask(message, 'task'); assert.equal(settings.length, 1);
 });
 
+test('background activity patches its own element and clears before closing the card', async () => {
+  const f = channel(); const activity: any[] = []; const sequence: number[] = [];
+  f.client.cardkit.v1.card.create = async () => ({ code: 0, data: { card_id: 'entity' } });
+  f.client.im.message.reply = async () => ({ code: 0, data: { message_id: 'card' } });
+  f.client.cardkit.v1.cardElement.content = async p => { sequence.push(p.data.sequence!); return { code: 0 }; };
+  f.client.cardkit.v1.cardElement.patch = async p => {
+    activity.push(p);
+    sequence.push(p.data.sequence!);
+    return { code: 0 };
+  };
+  f.client.cardkit.v1.card.settings = async p => { sequence.push(p.data.sequence!); return { code: 0 }; };
+  await f.task(m, { id: 'task', state: 'running', text: 'initial' });
+  await f.task(m, { id: 'task', state: 'running', text: 'initial', backgroundActivity: '后台等待' });
+  await f.task(m, { id: 'task', state: 'completed', text: 'initial done' });
+  assert.deepEqual(activity.map(p => p.path.element_id), ['activity', 'activity']);
+  assert.deepEqual(activity.map(p => JSON.parse(p.data.partial_element)), [{ content: '后台等待' }, { content: '' }]);
+  assert.deepEqual(sequence, [1, 2, 3, 4, 5]);
+});
+
 test('streamed answer grows without rewrites when activity changes or crosses a split boundary', async () => {
   const f = channel(); const bodyUpdates: string[] = []; const posts: string[] = [];
   f.client.cardkit.v1.card.create = async () => ({ code: 0, data: { card_id: 'entity' } });
