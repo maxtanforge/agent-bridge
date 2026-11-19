@@ -1,6 +1,7 @@
 /** 有界的运行时事件投影；不保存工具输入、输出、凭据或模型思考。 */
-import type { RuntimeEvent } from './types.ts';
+import type { BackgroundActivity, RuntimeEvent } from './types.ts';
 import { basename, isAbsolute, relative, resolve, sep, win32 } from 'node:path';
+import { BackgroundStatusLabel } from './task.ts';
 
 export const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const text = (value: unknown, max = 240) => typeof value === 'string' ? Array.from(value).slice(0, max).join('') : '';
@@ -18,10 +19,12 @@ export class AgentState {
   private plan: { content: string; status: string }[] = [];
   private usage?: { used: number; size: number; amount?: number; currency: string };
   private capabilities?: { steering: boolean; image: boolean };
+  private background?: BackgroundActivity;
   private options: { id: string; name: string; value: string; values: string[] }[] = [];
   apply(event: RuntimeEvent) {
     if (event.type === 'capabilities') { this.capabilities = { steering: event.steering, image: event.image }; return; }
     if (event.type === 'config') { this.config(event.options); return; }
+    if (event.type === 'background') { this.background = event.activity; return; }
     const u = event.update;
     switch (u.sessionUpdate) {
       case 'session_info_update':
@@ -88,7 +91,23 @@ export class AgentState {
     const latest = [...this.tools.values()].at(-1);
     return this.activityText(latest ? `最近工具：${latest.title}（${latest.status}）` : '');
   }
+  clearBackground() {
+    const wasWaiting = this.background !== undefined;
+    this.background = undefined;
+    return wasWaiting;
+  }
   activityText(fallback = '正在处理') {
+    if (this.background) {
+      const { running, completed, failed, stopped, items } = this.background;
+      const counts = [
+        running ? `后台还有 ${running} 项正在运行` : '后台任务已结束，正在等待 Claude 收尾',
+        completed ? `已完成 ${completed} 项` : '',
+        failed ? `失败 ${failed} 项` : '',
+        stopped ? `已停止 ${stopped} 项` : '',
+      ].filter(Boolean).join('，');
+      const details = items.map(item => `${item.title}（${BackgroundStatusLabel[item.status]}）`).join('；');
+      return details ? `${counts}\n${details}` : counts;
+    }
     const active = [...this.tools.values()].filter(activeTool);
     if (active.length) return `正在执行工具（${active.length} 项）：${active.slice(0, 3).map(t => t.title).join('；')}`;
     const step = this.plan.find(e => e.status === 'in_progress');

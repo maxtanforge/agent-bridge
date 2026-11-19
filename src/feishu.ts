@@ -6,7 +6,7 @@ import { DeliveryError, deliveryFailure, apiDeliveryFailure } from './delivery-e
 import { z } from 'zod';
 import type { Logger } from 'pino';
 import type { Channel, Inbound, TaskReply, PromptAttachment } from './types.ts';
-import { ContentElementId, FeishuReplies, richPost, streamCard } from './feishu-replies.ts';
+import { ActivityElementId, ContentElementId, FeishuReplies, richPost, streamCard } from './feishu-replies.ts';
 import { errorFacts } from './diagnostics.ts';
 
 const eventSchema = z.object({
@@ -97,6 +97,12 @@ export class Feishu implements Channel {
       update: async (card, content, sequence, uuid, signal) => {
         await this.cardApi(signal, () => this.client.cardkit.v1.cardElement.content({
           path: { card_id: card, element_id: ContentElementId }, data: { content, sequence, uuid },
+        }));
+      },
+      updateActivity: async (card, content, sequence, uuid, signal) => {
+        await this.cardApi(signal, () => this.client.cardkit.v1.cardElement.patch({
+          path: { card_id: card, element_id: ActivityElementId },
+          data: { partial_element: JSON.stringify({ content }), sequence, uuid },
         }));
       },
       close: async (card, text, sequence, uuid, signal) => {

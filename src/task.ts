@@ -1,5 +1,11 @@
 /** 任务领域值集中定义；as const 对象 + 派生联合类型（不用 enum 关键字），
  *  兼容 Node 原生 TypeScript 的可擦除语法与 tsconfig 的 erasableSyntaxOnly。 */
+import type { BackgroundStatus } from './types.ts';
+
+export const BackgroundStatusLabel: Record<BackgroundStatus, string> = {
+  running: '运行中', completed: '已完成', failed: '失败', stopped: '已停止',
+};
+
 export const TaskState = {
   Queued: 'queued', Running: 'running', Completed: 'completed', Failed: 'failed', Cancelled: 'cancelled', Interrupted: 'interrupted',
 } as const;
@@ -9,11 +15,13 @@ export type TaskReplyState = Exclude<TaskState, typeof TaskState.Interrupted | t
 
 /** 内存中的执行阶段比持久化终态更细，用于 /status，不表示进度百分比。 */
 export const TaskPhase = {
-  Starting: 'starting', Executing: 'executing', Cancelling: 'cancelling', Delivering: 'delivering',
+  Starting: 'starting', Executing: 'executing', WaitingBackground: 'waiting_background',
+  Cancelling: 'cancelling', Delivering: 'delivering',
 } as const;
 export type TaskPhase = typeof TaskPhase[keyof typeof TaskPhase];
 export const TaskPhaseLabel: Record<TaskPhase, string> = {
   [TaskPhase.Starting]: '准备中', [TaskPhase.Executing]: '执行中',
+  [TaskPhase.WaitingBackground]: '等待后台任务',
   [TaskPhase.Cancelling]: '取消中', [TaskPhase.Delivering]: '结果发送与清理中',
 };
 
@@ -24,7 +32,8 @@ export type DeliveryState = typeof DeliveryState[keyof typeof DeliveryState];
 /** 只有 end_turn 表示正常完成；限制、拒绝及未知原因均不能记为成功。 */
 export const StopReason = {
   EndTurn: 'end_turn', Cancelled: 'cancelled', MaxTokens: 'max_tokens',
-  MaxTurnRequests: 'max_turn_requests', Refusal: 'refusal',
+  MaxTurnRequests: 'max_turn_requests', Refusal: 'refusal', BackgroundFailed: 'background_failed',
+  BackgroundFollowupFailed: 'background_followup_failed',
 } as const;
 
 export function incompleteReasonText(reason: string): string {
@@ -32,6 +41,8 @@ export function incompleteReasonText(reason: string): string {
     case StopReason.MaxTurnRequests: return '任务达到执行限制，未正常完成。';
     case StopReason.MaxTokens: return '任务达到输出长度上限，未正常完成。';
     case StopReason.Refusal: return '模型拒绝执行此请求，任务未完成。';
+    case StopReason.BackgroundFailed: return '有后台任务失败或被停止。';
+    case StopReason.BackgroundFollowupFailed: return 'Claude 的后台结果汇总未正常完成。';
     default: return '任务未正常完成，请检查执行情况后再继续。';
   }
 }
@@ -48,6 +59,7 @@ export const TaskLimits = {
   ProgressIntervalMs: 250,
   FeedbackTimeoutMs: 3000,
   BackgroundNoticeDelayMs: 5000,
+  BackgroundFollowupGraceMs: 5000,
   SessionIdleTimeoutMs: 4 * 60 * 60 * 1000,
   MaxQueuedTasks: 20,
 } as const;

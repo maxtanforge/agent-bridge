@@ -3,9 +3,20 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
+import { z } from 'zod';
 import { client, ndJsonStream, PROTOCOL_VERSION, type ClientConnection, CreateElicitationRequest, type SessionNotification } from '@agentclientprotocol/sdk/unstable';
 import type { Runtime, RuntimeHooks, RuntimeOptions, AgentQuestion, PromptAttachment } from './types.ts';
 import { version } from './version.ts';
+import { ClaudeBackground } from './claude-background.ts';
+import { StopReason } from './task.ts';
+
+const SdkMessage = z.object({ sessionId: z.string(), message: z.unknown() });
+const BackgroundMessages = [
+  ...['task_started', 'task_updated', 'task_notification', 'background_tasks_changed', 'session_state_changed']
+    .map(subtype => ({ type: 'system', subtype })),
+  { type: 'user', origin: 'task-notification' },
+  { type: 'result', origin: 'task-notification' },
+];
 
 /** 免审批模式 ID：会话必须声明支持且 set_mode 确认后才允许 prompt。 */
 const BypassMode = 'bypassPermissions';
@@ -30,6 +41,9 @@ export class AcpRuntime implements Runtime {
   private closeSession?: string;
   private closeSupported = false;
   private prompting = false;
+  private background?: ClaudeBackground;
+  private backgroundActivity?: (run: ClaudeBackground) => void;
+  private backgroundSummary?: (text: string) => void;
   constructor(cwd: string, entry?: string, options: RuntimeOptions = {}) {
     this.options = options;
     this.cwd = cwd;
@@ -93,14 +107,34 @@ export class AcpRuntime implements Runtime {
       if (['available_commands_update', 'session_info_update'].includes(u.sessionUpdate) || (live && this.prompting && ['tool_call', 'tool_call_update', 'plan', 'usage_update'].includes(u.sessionUpdate))) {
         hooks.onEvent?.({ type: 'update', update: u });
       }
-      if (live && this.prompting && u.sessionUpdate === 'agent_message_chunk' && u.content.type === 'text') update(u.content.text);
+      if (live && this.prompting && u.sessionUpdate === 'agent_message_chunk' && u.content.type === 'text') {
+        const run = this.background;
+        let prefix = '';
+        if (run?.waiting && u.content.text) {
+          // Child output is grouped in its native completion report. Keep the main follow-up readable.
+          if ((u._meta?.claudeCode as { parentToolUseId?: unknown } | undefined)?.parentToolUseId) return;
+          if (!run.hasFollowupText) prefix = '\n\n';
+          run.hasFollowupText = true;
+          run.noteFollowup();
+        }
+        update(prefix + u.content.text);
+      }
     };
+    this.backgroundActivity = run => hooks.onEvent?.({ type: 'background', activity: run.activity() });
+    this.backgroundSummary = update;
     const connection: ClientConnection = client()
       .onNotification('session/update', ({ params }) => notification(params))
+      .onNotification('_claude/sdkMessage', SdkMessage, ({ params }) => {
+        if (this.connection !== connection || !live || !activeSession || !this.background) return;
+        if (params.sessionId === activeSession && this.background.apply(params.message) && this.background.waiting) {
+          this.backgroundActivity?.(this.background);
+        }
+      })
       .onRequest('elicitation/create', async ({ params, signal: requestSignal }) => {
         if (this.connection !== connection || !hooks.onQuestion || !live || !this.prompting || !CreateElicitationRequest.isForm(params) || !('sessionId' in params) || params.sessionId !== activeSession) return { action: 'cancel' as const };
         const combined = AbortSignal.any([requestSignal, this.lifetime.signal]);
         if (combined.aborted) return { action: 'cancel' as const };
+        if (this.background?.waiting) this.background.noteFollowup();
         const answer = await new Promise<import('./types.ts').QuestionAnswer>((resolve, reject) => {
           const abort = () => resolve({ action: 'cancel' });
           combined.addEventListener('abort', abort, { once: true });
@@ -127,18 +161,24 @@ export class AcpRuntime implements Runtime {
     const opts = () => ({ cancellationSignal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30000)]) : AbortSignal.timeout(30000), stopWaitingOnCancel: true });
     const sessionParams = {
       cwd: this.cwd, mcpServers: this.options.mcpServers ?? [],
-      _meta: { claudeCode: { options: {
-        allowDangerouslySkipPermissions: true,
-        // Adapter retains its native user/project/local settingSources defaults.
-        settings: { includeCoAuthoredBy: false, attribution: { commit: '', pr: '', sessionUrl: false } },
-        ...(this.options.maxTurns === undefined ? {} : { maxTurns: this.options.maxTurns }),
-        ...(this.options.maxBudgetUsd === undefined ? {} : { maxBudgetUsd: this.options.maxBudgetUsd }),
-      } } },
+      _meta: { claudeCode: {
+        emitRawSDKMessages: BackgroundMessages,
+        options: {
+          allowDangerouslySkipPermissions: true,
+          // Adapter retains its native user/project/local settingSources defaults.
+          settings: { includeCoAuthoredBy: false, attribution: { commit: '', pr: '', sessionUrl: false } },
+          ...(this.options.maxTurns === undefined ? {} : { maxTurns: this.options.maxTurns }),
+          ...(this.options.maxBudgetUsd === undefined ? {} : { maxBudgetUsd: this.options.maxBudgetUsd }),
+        },
+      } },
     };
     try {
       signal?.throwIfAborted();
       const init = await connection.agent.request('initialize', {
-        protocolVersion: PROTOCOL_VERSION, clientCapabilities: hooks.onQuestion ? { elicitation: { form: {} } } : {}, clientInfo: { name: 'agent-bridge', version },
+        protocolVersion: PROTOCOL_VERSION, clientCapabilities: {
+          ...(hooks.onQuestion ? { elicitation: { form: {} } } : {}),
+          _meta: { jetbrains: { air: { version: 1, capabilities: ['backgroundSubagents'] } } },
+        }, clientInfo: { name: 'agent-bridge', version },
       }, opts());
       if (init.protocolVersion !== PROTOCOL_VERSION) throw new Error('Unsupported ACP version');
       this.steering = (init._meta?.steering as { supported?: unknown } | undefined)?.supported === true;
@@ -191,12 +231,34 @@ export class AcpRuntime implements Runtime {
   async prompt(sessionId: string, text: string, attachments: PromptAttachment[] = []) {
     if (!this.connection || this.readySession !== sessionId) throw new Error('Runtime not ready');
     if (attachments.some(a => a.type === 'image') && !this.image) throw new Error('Native image input unavailable');
-    // 等待整轮执行结束；不因暂时没有 agent_message_chunk 就中断工具工作。
+    // The Adapter may answer this prompt while Claude still has background work.
     const prompt: import('@agentclientprotocol/sdk/unstable').ContentBlock[] = [{ type: 'text', text }, ...attachments];
     const connection = this.connection;
+    const lifetime = this.lifetime.signal;
+    const background = new ClaudeBackground();
+    this.background = background;
     this.prompting = true;
-    try { return (await connection.agent.request('session/prompt', { sessionId, prompt })).stopReason; }
-    finally { if (this.connection === connection) this.prompting = false; }
+    try {
+      const { stopReason } = await connection.agent.request('session/prompt', { sessionId, prompt });
+      if (stopReason !== StopReason.EndTurn || !background.tracked) return stopReason;
+      background.waiting = true;
+      this.backgroundActivity?.(background);
+      try { await background.drain(lifetime); }
+      catch (error) {
+        if (lifetime.aborted && !connection.signal.aborted && this.connection === connection) return StopReason.Cancelled;
+        throw error;
+      }
+      const summary = background.summary();
+      if (summary) this.backgroundSummary?.(`\n\n后台结果\n${summary}`);
+      if (background.followupFailed) return StopReason.BackgroundFollowupFailed;
+      const { failed, stopped } = background.activity();
+      return failed || stopped ? StopReason.BackgroundFailed : stopReason;
+    } finally {
+      if (this.background === background) {
+        this.background = undefined;
+        this.prompting = false;
+      }
+    }
   }
   async steer(sessionId: string, text: string, attachments: PromptAttachment[] = []): Promise<'injected' | 'promptRequired'> {
     if (!this.connection || this.readySession !== sessionId) throw new Error('Runtime not ready');
@@ -225,6 +287,7 @@ export class AcpRuntime implements Runtime {
     const connection = this.connection;
     const closeSession = this.closeSupported ? this.closeSession : undefined;
     this.closeSession = undefined; this.closeSupported = false;
+    this.background = undefined; this.backgroundActivity = undefined; this.backgroundSummary = undefined;
     this.prompting = false;
     this.connection = undefined; this.readySession = undefined;
     if (!child && !connection) return Promise.resolve();

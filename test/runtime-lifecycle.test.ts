@@ -126,3 +126,44 @@ test('multiple prompts within one open retain the same connection and session', 
   assert.deepEqual(calls().filter(c => c.method === 'session/prompt').map(c => c.params.sessionId), ['saved', 'saved']);
   assert.equal(calls().filter(c => c.method === 'initialize').length, 1);
 }));
+
+for (const variant of ['background', 'background-failed']) {
+  test(`retains background work and a follow-up question after end_turn (${variant})`, { timeout: 5000 }, async () => scenario({}, async (rt, calls) => {
+    const events: string[] = [];
+    const counts: number[] = [];
+    const answer = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    const session = await rt.open('saved', chunk => events.push(chunk), permission, undefined, {
+      async onQuestion() { started.resolve(); await answer.promise; return { action: 'accept', content: {} }; },
+      onEvent(event) { if (event.type === 'background') counts.push(event.activity.running); },
+    });
+    const run = rt.prompt(session, variant);
+    try {
+      assert.equal(await Promise.race([run, started.promise]), undefined, 'end_turn must not release the task before the follow-up finishes');
+      assert.deepEqual(events, ['started']);
+      assert.ok(calls().find(c => c.method === 'initialize').params.clientCapabilities._meta.jetbrains.air.capabilities.includes('backgroundSubagents'));
+    } finally { answer.resolve(); }
+    assert.equal(await run, variant === 'background-failed' ? 'background_failed' : 'end_turn');
+    assert.deepEqual(counts, [2, 1, 0]);
+    assert.match(events.join(''), /follow-up summary/);
+    assert.doesNotMatch(events.join(''), /Stale failure/);
+  }));
+}
+
+for (const interruptedBy of ['cancel', 'disconnect']) {
+  test(`releases the wait for background work after ${interruptedBy}`, { timeout: 5000 }, async () => scenario({}, async rt => {
+    const waiting = Promise.withResolvers<void>();
+    const session = await rt.open(undefined, () => {}, permission, undefined, {
+      onEvent(event) { if (event.type === 'background') waiting.resolve(); },
+    });
+    const run = rt.prompt(session, 'background-hang');
+    await waiting.promise;
+    if (interruptedBy === 'cancel') {
+      await rt.cancel(session);
+      assert.equal(await run, 'cancelled');
+    } else {
+      rt.connection!.close(new Error('lost background transport'));
+      await assert.rejects(run);
+    }
+  }));
+}

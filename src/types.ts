@@ -36,6 +36,8 @@ export interface TaskReply {
   note?: string;
   /** Running activity, separate from agent-authored text. */
   activity?: string;
+  /** Volatile background progress rendered outside the append-only answer. */
+  backgroundActivity?: string;
   /** Notify completion when a long stream only updates an existing card. */
   notifyCompletion?: boolean;
 }
@@ -58,7 +60,10 @@ export interface Channel {
 }
 
 /** Bridge 对 ACP 运行时的依赖；生产实现见 runtime.ts，测试以替身满足。 */
+export type BackgroundStatus = 'running' | 'completed' | 'failed' | 'stopped';
+export type BackgroundActivity = Record<BackgroundStatus, number> & { items: { title: string; status: BackgroundStatus }[] };
 export type RuntimeEvent = { type: 'capabilities'; steering: boolean; image: boolean; [key: string]: unknown }
+  | { type: 'background'; activity: BackgroundActivity }
   | { type: 'update'; update: Record<string, unknown> } | { type: 'config'; options: unknown[] };
 export interface AgentQuestion { sessionId: string; message: string; requestedSchema: { type: 'object'; properties: Record<string, unknown>; required?: string[] } }
 export interface QuestionAnswer { action: 'accept' | 'decline' | 'cancel'; content?: Record<string, string | number | boolean | string[]> }

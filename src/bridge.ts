@@ -385,7 +385,8 @@ export class Bridge {
       send: async (text, activity) => {
         if (!this.channel.task && plainAcknowledged) return true;
         const sent = await this.deliver(signal => this.channel.task
-          ? this.channel.task(m, { id, state: TaskState.Running, text, activity, note }, signal)
+          ? this.channel.task(m, { id, state: TaskState.Running, text, activity, note,
+            backgroundActivity: a.phase === TaskPhase.WaitingBackground ? activity : undefined }, signal)
           : this.channel.send(m, `任务正在执行，完成后通知你。\n任务编号：${id}`, signal), false, feedbackLimit);
         plainAcknowledged ||= sent; return sent;
       },
@@ -402,6 +403,7 @@ export class Bridge {
     // 这是包含初始化的总执行时限；长时间无文字输出不会单独触发取消。
     let timedOut = false;
     let promptStarted = false;
+    let backgroundWaited = false;
     const deadline = setTimeout(() => {
       if (a.cancelled) return;
       timedOut = true;
@@ -436,18 +438,31 @@ export class Bridge {
         // bypassPermissions is established before prompt; unexpected requests must not wait on chat.
         this.log.warn({ task: id, stage: 'unexpected-permission' }, 'Unexpected permission request in noninteractive mode');
         return { outcome: { outcome: 'cancelled' } };
-      }, a.opening.signal, featureRun.hooks);
+      }, a.opening.signal, {
+        ...featureRun.hooks,
+        onEvent: event => {
+          if (event.type === 'background' && !a.cancelled) {
+            backgroundWaited = true;
+            a.phase = TaskPhase.WaitingBackground;
+          }
+          featureRun?.hooks.onEvent?.(event);
+        },
+      });
       if (a.cancelled) throw new Error('cancelled');
       if (old && old !== a.session) throw new SessionRestoreError(old);
       this.db.saveSession(this.key(m), a.session);
       if (a.cancelled) throw new Error('cancelled');
-      a.phase = TaskPhase.Executing;
       featureRun.attach(a.session);
       promptStarted = true;
       let reason: string;
       let input = { message: m, attachments };
       for (;;) {
         a.opening.signal.throwIfAborted();
+        a.phase = TaskPhase.Executing;
+        if (featureRun.state.clearBackground()) {
+          activity = featureRun.state.activityText('正在回复');
+          feedback?.update(snapshot(), activity);
+        }
         const prompt = this.runtime.prompt(a.session, input.message.text, input.attachments);
         a.inputs.startTurn();
         try { reason = await prompt; }
@@ -484,9 +499,10 @@ export class Bridge {
       executionEnded = true;
       const undelivered = a.inputs.close();
       if (undelivered) result += `\n\n当前任务结束，${undelivered} 条待投递补充未执行；未转入独立任务队列。`;
-      const notifyCompletion = !background && Date.now() - a.startedAt >=
-        (this.options.backgroundNoticeMs ?? TaskLimits.BackgroundNoticeDelayMs);
+      const notifyCompletion = !background && (backgroundWaited || Date.now() - a.startedAt >=
+        (this.options.backgroundNoticeMs ?? TaskLimits.BackgroundNoticeDelayMs));
       const progressDelivery = feedback?.stop();
+      featureRun?.state.clearBackground();
       featureRun?.end();
       executionDone();
       try {

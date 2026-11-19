@@ -3,9 +3,68 @@ import assert from 'node:assert/strict';
 import { setImmediate as nextTurn } from 'node:timers/promises';
 import { Bridge } from '../src/bridge.ts';
 import { Store } from '../src/store.ts';
-import type { Runtime, Inbound } from '../src/types.ts';
+import type { Runtime, RuntimeHooks, Inbound, TaskReply } from '../src/types.ts';
 
 const message: Inbound = { account: 'a', chat: 'c', thread: 't', user: 'u', id: 'work', text: 'long task' };
+
+test('shows the foreground reply while background work still holds the queue', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const db = new Store(':memory:');
+  const replies: TaskReply[] = [];
+  const sent: string[] = [];
+  const finish = Promise.withResolvers<string>();
+  let hooks: RuntimeHooks | undefined;
+  let write!: (text: string) => void;
+  let prompts = 0;
+  const runtime: Runtime = {
+    async open(_old, update, _permission, _signal, options) {
+      hooks = options;
+      write = update;
+      return 's';
+    },
+    async prompt() {
+      if (++prompts > 1) return 'end_turn';
+      write('foreground response');
+      hooks?.onEvent?.({ type: 'background', activity: {
+        running: 2, completed: 0, failed: 0, stopped: 0,
+        items: [{ title: 'Review', status: 'running' }, { title: 'Build', status: 'running' }],
+      } });
+      return finish.promise;
+    },
+    async cancel() { finish.resolve('cancelled'); },
+    async stop() {},
+  };
+  const bridge = new Bridge(db, runtime, {
+    async send(_m, text) { sent.push(text); },
+    async task(_m, reply) { replies.push(reply); },
+  }, { users: ['u'], admins: [], workspace: 'w', taskTimeout: 10000, cancelGrace: 10 });
+  const run = bridge.handle(message);
+  try {
+    await nextTurn();
+    await bridge.handle({ ...message, id: 'queued', text: '/queue next' });
+    await bridge.handle({ ...message, id: 'status-bg', text: '/status' });
+    t.mock.timers.tick(250);
+    await nextTurn();
+    assert.equal(prompts, 1);
+    assert.match(sent.at(-1)!, /等待后台任务/);
+    assert.match(replies.at(-1)!.activity!, /后台.*2 项/);
+    assert.match(replies.at(-1)!.activity!, /Review（运行中）/);
+    assert.equal(replies.at(-1)!.text, 'foreground response');
+    assert.equal(replies.at(-1)!.state, 'running');
+    finish.resolve('background_failed');
+    await run;
+    await nextTurn();
+    assert.equal(prompts, 2);
+    assert.equal(replies.find(reply => reply.state === 'failed')?.notifyCompletion, true);
+    assert.ok(replies.some(reply => reply.state === 'failed' && /后台任务失败或被停止/.test(reply.text)));
+  } finally {
+    finish.resolve('cancelled');
+    await run;
+    await bridge.stop();
+    db.close();
+    t.mock.timers.reset();
+  }
+});
 function fixture() {
   const db = new Store(':memory:'); const sent: string[] = [];
   let finish!: (reason: string) => void; let update!: (text: string) => void; let prompts = 0; let stops = 0;

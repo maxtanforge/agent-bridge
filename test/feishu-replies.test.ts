@@ -9,6 +9,7 @@ function fixture() {
     async create() { calls.push({ op: 'create' }); return 'card'; },
     async reply(_m, card, uuid) { calls.push({ op: 'reply', card, uuid }); return 'message'; },
     async update(card, text, sequence) { calls.push({ op: 'update', card, text, sequence }); },
+    async updateActivity(card, text, sequence) { calls.push({ op: 'activity', card, text, sequence }); },
     async close(card, text, sequence) { calls.push({ op: 'close', card, text, sequence }); },
     async post(_m, text, uuid) { calls.push({ op: 'post', text, uuid }); },
   };
@@ -35,6 +36,17 @@ test('unavailable CardKit sends one acknowledgement then final without repeated 
   await replies.task(message, { id: 't', state: 'completed', text: 'answer' });
   assert.equal(creates, 1); assert.deepEqual(calls.map(c => c.op), ['post', 'post']);
   assert.match(String(calls[0].text), /正在执行/); assert.equal(calls[1].text, 'answer');
+});
+
+test('background activity changes on a separate card element while the answer only appends', async () => {
+  const { calls, replies } = fixture();
+  await replies.task(message, { id: 't', state: 'running', text: 'draft' });
+  await replies.task(message, { id: 't', state: 'running', text: 'draft', backgroundActivity: '后台还有 2 项' });
+  await replies.task(message, { id: 't', state: 'running', text: 'draft summary', backgroundActivity: '后台还有 1 项' });
+  await replies.task(message, { id: 't', state: 'completed', text: 'draft summary done' });
+  assert.deepEqual(calls.filter(c => c.op === 'update').map(c => c.text), ['draft', 'draft summary', 'draft summary done']);
+  assert.deepEqual(calls.filter(c => c.op === 'activity').map(c => c.text), ['后台还有 2 项', '后台还有 1 项', '']);
+  assert.ok(JSON.parse(streamCard()).body.elements.some((element: { element_id: string }) => element.element_id === 'activity'));
 });
 
 test('long stream completion reminder is deduplicated and activity is removed from final', async () => {

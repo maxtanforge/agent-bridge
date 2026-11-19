@@ -85,7 +85,7 @@ stateDiagram-v2
   [*] --> running: 工作区空闲
   queued --> running: 队首开始执行
   queued --> cancelled: /cancel 编号 或 /cancel all
-  running --> completed: end_turn
+  running --> completed: end_turn 且已跟踪后台工作结束
   running --> failed: 输出限制 / 模型拒绝 / 未知结束原因 / 异常
   running --> cancelled: /cancel 或执行超时
   queued --> interrupted: 停机或异常退出后重启
@@ -97,7 +97,7 @@ stateDiagram-v2
   note right of interrupted: 异常重启不重放任务，queued 任务同时保存未执行结果
 ```
 
-`starting`、`executing`、`cancelling`、`delivering` 是内存中的 TaskPhase，不写入 SQLite 的任务终态；终态与结果文本在同一事务中保存。仅 `end_turn` 记为 `completed`，非正常结束保留部分输出和原因，供 `/result` 取回。正常停机时，执行中任务走取消路径记为 `cancelled`，排队任务记为 `interrupted`。
+`starting`、`executing`、`waiting_background`、`cancelling`、`delivering` 是内存中的 TaskPhase。SQLite 同事务保存终态与结果文本。ACP 回合正常结束、后台活动和会话收尾通过后记为 `completed`；非正常结束保留部分输出和原因，供 `/result` 取回。正常停机时，执行中任务走取消路径记为 `cancelled`，排队任务记为 `interrupted`。
 
 ## 运行范围与技术选型
 
@@ -196,14 +196,14 @@ flowchart TD
 4. 每项任务建立运行时并 initialize；同一任务内的连续 prompt 使用同一连接。协议版本保持 ACP v1，跨任务通过持久化 session ID 恢复上下文。
 5. 有会话映射时优先协商 session/resume，其次 loadSession；不能恢复则抛出 SessionRestoreError，保留映射及本条未执行文字，不调用 session/new 静默替换上下文。
 6. 建立权限模式后保存会话 ID，再发送 prompt。当前任务的补充缓冲最多 20 条，按顺序处理；已确认未注入的 promptRequired 输入及原生命令在同一会话进入后续 prompt，继续占有当前工作区锁且不重置总时限。未知投递结果不重发。
-7. 仅 stopReason 为 end_turn 时标记 completed；取消响应标记 cancelled，达到执行或输出限制、模型拒绝、未知结束原因及执行异常标记 failed。非正常结束响应保留部分输出并附原因，随结果持久化，供 /result 取回。所有终态均等待运行进程清理。清理失败时停止接受新消息，并保留运行进程句柄以便再次清理。
+7. 收到 end_turn 后，如果本轮有已跟踪的 Claude 后台任务，继续消费事件直到后台终态和会话空闲。成功标记 completed；取消响应标记 cancelled，后台任务失败或停止、达到执行或输出限制、模型拒绝、未知结束原因及执行异常标记 failed。非正常结束保留部分输出并附原因，供 /result 取回。所有终态均等待运行进程清理。清理失败时停止接受新消息，并保留运行进程句柄以便再次清理。
 8. 执行结束后，先清理 Adapter；随后在同一事务中保存终态与最终文本，刷新会话时间并释放工作区。同步将队首 queued 改为 running 并设置 active，保持 FIFO。入队回执与执行并行，最终回复等待本任务的回执及在途进度消息。不同任务的飞书回复可并行投递。队列启动落库或进程清理失败时停止调度并中断剩余队列。Bridge 通知入口停止服务并以非零状态退出，由部署环境重启实例。
 
-所有任务结束时先关闭 Adapter 再交接工作区。ACP v1 的 prompt 结束不能证明后台活动已停止，暂缓跨任务热复用，避免迟到事件混入下一项和执行逃逸任务时限。若协商支持 session/close，先有界请求关闭再终止进程；遗留后台命令可能随之终止。全局闲置满 SESSION_IDLE_TIMEOUT_MS 的清理保留为兜底，新任务等待已开始的闲置清理完成。stdout 用于 ACP，stderr 消费但不写业务日志。普通启动协议请求上限三十秒，prompt 受任务总时限控制。
+所有任务结束时先关闭 Adapter 再交接工作区。运行时订阅 Claude 后台任务及空闲事件，等待本轮后台工作和后续汇总结束后再清理。跨任务使用独立进程，隔离迟到事件并约束执行时限。若协商支持 session/close，先有界请求关闭再终止进程；未纳入 Claude 跟踪的进程可能随之终止。全局闲置满 SESSION_IDLE_TIMEOUT_MS 的清理保留为兜底，新任务等待已开始的闲置清理完成。stdout 用于 ACP，stderr 消费但不写业务日志。普通启动协议请求上限三十秒。
 
 会话映射保存 last_used_at，但不再按闲置时长删除；四小时仅为空闲资源清理兜底。/new 显式删除映射，/resume 选择本人历史，旧版无活动时间映射仍需显式恢复。查询和回执不刷新资源闲置计时。管理命令在任务接纳前处理，队列满仍可使用；本人有未完成任务时不能 /new。
 
-TASK_TIMEOUT_MS 默认两小时、最大二十四小时，覆盖初始化、当前任务及其补充引起的后续 prompt。正文、补充和用户回答均不延长时限；没有独立的文字静默取消计时器。独立任务 FIFO 排队时间不计入执行时限。服务重启不自动重放队列或补充，不提供脱离 prompt 的后台命令完成调度。
+TASK_TIMEOUT_MS 默认两小时、最大二十四小时，覆盖初始化、本轮后台任务、后续汇总及补充引起的后续 prompt。正文、补充和用户回答均不延长时限；没有独立的文字静默取消计时器。独立任务 FIFO 排队时间不计入执行时限。队列和补充均不跨服务重启自动重放。
 
 内存阶段使用 TaskPhase：starting（准备）、executing（执行）、cancelling（取消）、delivering（结果发送与清理）；它们独立于 SQLite 中的任务终态。TaskState、DeliveryState、ChatCommand、StopReason 和 TaskLimits 在 task.ts 中集中定义为 as const 对象及派生联合类型；runtime 的免审批模式 ID、飞书回复消息类型、卡片正文元素 id 和投递错误类别同样以模块级常量收敛。不使用 enum 关键字，兼容 Node 直接运行 TypeScript 和 tsconfig 的 erasableSyntaxOnly。数据库中保存的即为这些字符串值。源码注释解释事务、去重、超时和进程清理约束；协议方法名、Zod 字面量和一次性局部字符串保持原样，不追求全部枚举化。
 
