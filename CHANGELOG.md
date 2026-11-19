@@ -4,6 +4,14 @@ Release Please 根据 Conventional Commits 在发布 PR 中维护此文件，版
 
 首个版本为 `package.json` 中的 `0.1.0`，对应 Git 标签 `v0.1.0` 和镜像标签 `0.1.0`。以下为接入版本管理时的能力记录，正式发布条目由 Release Please 在发布 PR 中生成。
 
+## [0.5.2](https://github.com/maxtanforge/agent-bridge/compare/v0.5.1...v0.5.2) (2026-11-19)
+
+
+### Bug Fixes
+
+* wait for Claude background tasks before completing replies ([08b46ea](https://github.com/maxtanforge/agent-bridge/commit/08b46ea06b4f18076b33e71eb52dd722450bba97))
+* wait for Claude background tasks before completing replies ([a652745](https://github.com/maxtanforge/agent-bridge/commit/a65274584af1fe1a782512522550d34fa636815c))
+
 ## [0.5.1](https://github.com/maxtanforge/agent-bridge/compare/v0.5.0...v0.5.1) (2026-11-18)
 
 
